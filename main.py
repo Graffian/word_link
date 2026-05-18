@@ -103,19 +103,21 @@ def load_cnn(path: str = MODEL_PATH,
         raise FileNotFoundError(f"Classes JSON not found: '{classes_path}'")
     with open(classes_path) as f:
         raw = json.load(f)
-    if isinstance(raw, list):
+    # Format: {"classes": ["A","B",...,"QU",...], "image_size": 32, "channels": 1}
+    if isinstance(raw, dict) and "classes" in raw:
+        CNN_CLASSES = [str(c).upper() for c in raw["classes"]]
+    elif isinstance(raw, list):
         CNN_CLASSES = [str(c).upper() for c in raw]
     elif isinstance(raw, dict):
-        # detect direction: if values are ints it's label→idx, invert it
         first_val = next(iter(raw.values()))
         if isinstance(first_val, int):
             CNN_CLASSES = [None] * len(raw)
             for label, idx in raw.items():
                 CNN_CLASSES[idx] = str(label).upper()
         else:
-            # keys are string indices
             CNN_CLASSES = [str(raw[k]).upper() for k in sorted(raw, key=lambda k: int(k))]
     print(f"  [CNN] Classes ({len(CNN_CLASSES)}): {CNN_CLASSES}")
+    print(f"  [CNN] QU is at index {CNN_CLASSES.index('QU')}")
 
     # ── Load Core ML model ───────────────────────────────────────────────────
     try:
@@ -164,8 +166,8 @@ def _classify_tile(img_grey: np.ndarray, idx: int) -> tuple[str, float]:
     arr    = np.array(pil, dtype=np.float32) / 255.0
     arr    = arr.reshape(1, 1, CNN_INPUT_SIZE, CNN_INPUT_SIZE)
     try:
-        pred   = _model.predict({"input": arr})
-        logits = np.array(next(iter(pred.values())), dtype=np.float32).flatten()
+        pred   = _model.predict({"tile": arr})       # input name from metadata.json
+        logits = np.array(pred["logits"], dtype=np.float32).flatten()  # output name from metadata.json
         probs  = _softmax(logits)
         i      = int(np.argmax(probs))
         conf   = float(probs[i])
