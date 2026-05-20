@@ -1,12 +1,13 @@
 """
-Boggle Bot — Tesseract OCR Edition
+Boggle Bot — Dynamic Contour & Tesseract Edition
 ──────────────────────────────────────────────────────────────────────────
 Pipeline:
   1. Screenshot via WebDriverAgent
-  2. Crop each board tile → Tesseract OCR (single-char mode) → letter (A-Z)
-  3. DFS solver over the curated dictionary
-  4. Swipe the best word's tile path on the board
-  5. Repeat on new board
+  2. OpenCV Contour Detection dynamically finds the 16 tiles (ignores UI shifts)
+  3. Crop each dynamic board tile → Tesseract OCR (single-char mode) → letter
+  4. DFS solver over the curated dictionary
+  5. Swipe the best word's tile path on the board using dynamic WDA coordinates
+  6. Repeat on new board
 
 Requirements:
   pip install pillow numpy requests opencv-python pytesseract
@@ -32,34 +33,26 @@ WDA_URL   = "http://localhost:8100"
 DICT_PATH = "Dictionary-curated.txt"
 
 # ── Timing ──
-BOARD_WAIT_OCR = 0.55   # wait after swipe before next screenshot (tile animation)
-HOLD_MS        = 50     # initial press on first tile
-TILE_PAUSE_MS  = 15     # slide duration between tiles (>0 = interpolated)
-LIFT_DELAY_MS  = 120    # hold on last tile before lifting
-
-IDLE_TIMEOUT   = 4.5    # seconds with no successful swipe → assume round over
+BOARD_WAIT_OCR = 0.55   
+HOLD_MS        = 50     
+TILE_PAUSE_MS  = 15     
+LIFT_DELAY_MS  = 120    
+IDLE_TIMEOUT   = 4.5    
 
 # ── Word filtering ──
-MIN_WORD_LEN = 5   # only play 5-7 letter words (best score/risk ratio)
+MIN_WORD_LEN = 5   
 MAX_WORD_LEN = 7
 
-# ── Crop ──
+# ── Crop & Scale ──
 COORD_SCALE  = 3.0    # physical px = WDA logical px × scale (3.0 for Retina)
-TILE_CROP_PX = 100    # half-side of square crop around each tile centre
 
 # ── Tesseract ──
-TEMPLATES_DIR = "templates"   # kept for calibrate() debug saves
+TEMPLATES_DIR = "templates"
 _TESS_CONFIG  = "--psm 10 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-# psm 10 = single character mode; whitelist prevents digit/symbol confusion
 
-# ── 4×4 board tile coordinates (WDA logical px) ──
-TILE_COORDS = {
-     0: ( 88, 393),  1: (174, 398),  2: (260, 396),  3: (349, 393),
-     4: ( 82, 483),  5: (175, 482),  6: (258, 477),  7: (361, 486),
-     8: ( 85, 574),  9: (173, 572), 10: (266, 572), 11: (357, 564),
-    12: ( 85, 662), 13: (177, 660), 14: (261, 656), 15: (362, 664),
-}
-
+# ── Dynamic Coordinates (Populated at Runtime) ──
+# Maps tile index (0-15) to its (x, y) logical WDA swipe coordinate
+DYNAMIC_TILE_COORDS = {}
 
 # ─────────────────────────────────────────
 #  BOGGLE SCORING
@@ -84,50 +77,98 @@ LETTER_VALUE = {
 def tile_score(word: str) -> int:
     return boggle_score(word) + sum(LETTER_VALUE.get(c, 1) for c in word.lower())
 
+# ─────────────────────────────────────────
+#  DYNAMIC CONTOUR DETECTION
+# ─────────────────────────────────────────
+def find_dynamic_grid(img_grey: np.ndarray):
+    """
+    Uses OpenCV to find 16 square tiles on the screen.
+    Returns a list of 16 bounding boxes (x, y, w, h) sorted in a 4x4 grid.
+    """
+    # 1. Edge detection to find the hard borders of the tiles
+    edges = cv2.Canny(img_grey, 50, 150)
+    
+    # Dilate slightly to connect broken edge lines
+    kernel = np.ones((3, 3), np.uint8)
+    edges = cv2.dilate(edges, kernel, iterations=1)
+    
+    # 2. Find contours
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    
+    squares = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        area = w * h
+        aspect_ratio = float(w) / h
+        
+        # 3. Filter for squares (Adjust area boundaries based on screen size if needed)
+        # 10000 to 120000 pixels roughly covers a 100x100 to 340x340 physical tile
+        if 10000 < area < 120000 and 0.85 <= aspect_ratio <= 1.15:
+            squares.append((x, y, w, h))
+            
+    # 4. Remove overlapping bounding boxes (keep the best ones)
+    squares.sort(key=lambda s: s[2]*s[3], reverse=True)
+    filtered_squares = []
+    
+    for s1 in squares:
+        overlap = False
+        cx1, cy1 = s1[0] + s1[2]//2, s1[1] + s1[3]//2
+        for s2 in filtered_squares:
+            cx2, cy2 = s2[0] + s2[2]//2, s2[1] + s2[3]//2
+            dist = np.sqrt((cx1-cx2)**2 + (cy1-cy2)**2)
+            if dist < 50: # If centers are within 50px, it's the same tile
+                overlap = True
+                break
+        if not overlap:
+            filtered_squares.append(s1)
+        if len(filtered_squares) == 16:
+            break
+            
+    if len(filtered_squares) != 16:
+        return None # Grid not found on this frame
+        
+    # 5. Sort into 4x4 reading order
+    # Sort all by Y (top to bottom)
+    filtered_squares.sort(key=lambda s: s[1])
+    
+    grid_boxes = []
+    for i in range(4):
+        # Take chunks of 4 (a row) and sort them by X (left to right)
+        row = filtered_squares[i*4 : (i+1)*4]
+        row.sort(key=lambda s: s[0])
+        grid_boxes.extend(row)
+        
+    return grid_boxes
 
 # ─────────────────────────────────────────
 #  TESSERACT OCR ENGINE
 # ─────────────────────────────────────────
-
 def _preprocess_for_tess(crop: np.ndarray) -> np.ndarray:
-    """
-    Prepares a tile crop for Tesseract single-char recognition.
-    - Drops the bottom 25% of the tile to cut off point-value dots
-    - Upscales to 128×128 (Tesseract accuracy degrades below ~32px)
-    - Otsu binarise → white background, black letter
-    - Adds a thick white border (Tesseract needs whitespace around char)
-    """
-    h = crop.shape[0]
-    # Remove point-value dots smartly: erase small connected blobs, keep the letter body
     _, bw_full = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bw_full, connectivity=8)
     clean = np.zeros_like(bw_full)
     tile_area = crop.shape[0] * crop.shape[1]
+    
+    # Filter out small noise (like point dots)
     for lbl in range(1, n_labels):
-        if stats[lbl, cv2.CC_STAT_AREA] > tile_area * 0.01:   # keep blobs > 1% of tile
+        if stats[lbl, cv2.CC_STAT_AREA] > tile_area * 0.01: 
             clean[labels == lbl] = 255
-    # convert back to white-bg black-letter
+            
     crop = cv2.bitwise_not(clean)
     large = cv2.resize(crop, (128, 128), interpolation=cv2.INTER_CUBIC)
     _, bw = cv2.threshold(large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if np.mean(bw) < 127:                                       # ensure white bg
+    if np.mean(bw) < 127:                                       
         bw = cv2.bitwise_not(bw)
     return cv2.copyMakeBorder(bw, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=255)
 
-
-def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
-    cx = int(TILE_COORDS[idx][0] * COORD_SCALE)
-    cy = int(TILE_COORDS[idx][1] * COORD_SCALE)
-    h, w = img_grey.shape[:2]
-    x1 = max(0, cx - TILE_CROP_PX)
-    y1 = max(0, cy - TILE_CROP_PX)
-    x2 = min(w, cx + TILE_CROP_PX)
-    y2 = min(h, cy + TILE_CROP_PX)
-    return img_grey[y1:y2, x1:x2]
-
-
-def _read_tile(img_grey: np.ndarray, idx: int) -> str:
-    crop = _crop_tile(img_grey, idx)
+def _read_tile(img_grey: np.ndarray, box: tuple, idx: int) -> str:
+    x, y, w, h = box
+    
+    # Shrink the box by 10% to completely eliminate the outer tile border from the crop
+    margin_x = int(w * 0.1)
+    margin_y = int(h * 0.1)
+    crop = img_grey[y + margin_y : y + h - margin_y, x + margin_x : x + w - margin_x]
+    
     if crop.size == 0:
         return "?"
 
@@ -135,19 +176,33 @@ def _read_tile(img_grey: np.ndarray, idx: int) -> str:
     pil   = Image.fromarray(ready)
     raw   = pytesseract.image_to_string(pil, config=_TESS_CONFIG).strip().upper()
 
-    # keep only the first valid letter (Tesseract sometimes returns trailing noise)
     letter = next((c for c in raw if c.isalpha()), None)
     if letter:
         return letter.lower()
 
-    print(f"  [OCR] No read at tile {idx:02d} (raw: {repr(raw)})")
     return "?"
 
-
 def ocr_board(img: Image.Image) -> list:
-    """Reads all 16 tiles instantly over memory."""
+    global DYNAMIC_TILE_COORDS
     img_grey = np.array(img.convert("L"))
-    letters = [_read_tile(img_grey, i) for i in range(16)]
+    
+    # Dynamically find the grid on this specific frame
+    grid_boxes = find_dynamic_grid(img_grey)
+    
+    if not grid_boxes:
+        print("  [Vision] Could not lock onto the 4x4 grid. UI might be transitioning.")
+        return ["?"] * 16
+        
+    letters = []
+    for i, box in enumerate(grid_boxes):
+        x, y, w, h = box
+        
+        # Calculate WDA logical coordinate for swiping (center of the box / scale)
+        cx_logical = (x + w // 2) / COORD_SCALE
+        cy_logical = (y + h // 2) / COORD_SCALE
+        DYNAMIC_TILE_COORDS[i] = (cx_logical, cy_logical)
+        
+        letters.append(_read_tile(img_grey, box, i))
 
     rows = [" ".join(f"{letters[r*4+c].upper():>2}" for c in range(4)) for r in range(4)]
     print(f"  OCR[Tess]:  {rows[0]}")
@@ -155,40 +210,14 @@ def ocr_board(img: Image.Image) -> list:
         print(f"              {row}")
     return letters
 
-
 # ─────────────────────────────────────────
-#  CALIBRATION
-# ─────────────────────────────────────────
-def calibrate():
-    os.makedirs(TEMPLATES_DIR, exist_ok=True)
-    print("  [calibrate] Connecting to WDA…")
-    get_session()
-    print("  [calibrate] Taking screenshot…")
-    img      = take_screenshot()
-    img_grey = np.array(img.convert("L"))
-    
-    for i in range(16):
-        crop = _crop_tile(img_grey, i)
-        if crop.size == 0:
-            continue
-        ready    = _preprocess_for_tess(crop)
-        out_path = os.path.join(TEMPLATES_DIR, f"tile_{i:02d}.png")
-        cv2.imwrite(out_path, ready)
-        
-    print(f"\n  Saved 16 processed crops to ./{TEMPLATES_DIR}/")
-    print("  Please map these files to true letters (e.g., rename tile_00.png -> A.png)")
-
-
-# ─────────────────────────────────────────
-#  DICTIONARY
+#  DICTIONARY & SOLVER
 # ─────────────────────────────────────────
 def load_dictionary(path: str = DICT_PATH):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Dictionary not found: '{path}'")
-
     with open(path, encoding="utf-8", errors="ignore") as fh:
         raw = {line.strip().lower() for line in fh if line.strip()}
-
     words    = {w for w in raw if len(w) >= MIN_WORD_LEN}
     prefixes: set[str] = set()
     for w in words:
@@ -196,10 +225,6 @@ def load_dictionary(path: str = DICT_PATH):
             prefixes.add(w[:i])
     return words, prefixes
 
-
-# ─────────────────────────────────────────
-#  SOLVER & UTILS
-# ─────────────────────────────────────────
 def _build_neighbours():
     nb = {}
     for idx in range(16):
@@ -213,10 +238,8 @@ def _build_neighbours():
 
 NEIGHBOURS = _build_neighbours()
 
-
 def solve_board(letters, words, prefixes):
     found = {}
-
     def dfs(idx, word, path, visited):
         if word not in prefixes:
             return
@@ -237,18 +260,17 @@ def solve_board(letters, words, prefixes):
 
     return dict(sorted(found.items(), key=lambda x: (boggle_score(x[0]), len(x[0])), reverse=True))
 
-
+# ─────────────────────────────────────────
+#  WDA DRIVER LOGIC
+# ─────────────────────────────────────────
 _http       = requests.Session()
 _http.headers.update({"Content-Type": "application/json"})
 _session_id = None
 
-
 def _create_session() -> str:
     r = _http.post(f"{WDA_URL}/session", json={"capabilities": {"alwaysMatch": {}}}, timeout=30)
     r.raise_for_status()
-    sid = r.json().get("sessionId") or r.json().get("value", {}).get("sessionId")
-    return sid
-
+    return r.json().get("sessionId") or r.json().get("value", {}).get("sessionId")
 
 def get_session() -> str:
     global _session_id
@@ -262,7 +284,6 @@ def get_session() -> str:
     except Exception: pass
     _session_id = _create_session()
     return _session_id
-
 
 def take_screenshot(retries: int = 3) -> Image.Image:
     global _session_id
@@ -281,17 +302,21 @@ def take_screenshot(retries: int = 3) -> Image.Image:
             if attempt < retries - 1: time.sleep(0.2)
     raise RuntimeError("Screenshot failed.")
 
-
 def swipe_path(indices):
-    sid    = get_session()
-    sx, sy = TILE_COORDS[indices[0]]
+    sid = get_session()
+    
+    # Ensure coordinates exist from the contour detector
+    if not DYNAMIC_TILE_COORDS:
+        return False
+        
+    sx, sy = DYNAMIC_TILE_COORDS[indices[0]]
     acts   = [
         {"type": "pointerMove", "duration": 0, "x": int(sx), "y": int(sy)},
         {"type": "pointerDown"},
         {"type": "pause",       "duration": HOLD_MS},
     ]
     for idx in indices[1:]:
-        tx, ty = TILE_COORDS[idx]
+        tx, ty = DYNAMIC_TILE_COORDS[idx]
         acts += [{"type": "pointerMove", "duration": TILE_PAUSE_MS, "x": int(tx), "y": int(ty)}]
     acts.append({"type": "pause", "duration": LIFT_DELAY_MS})
     acts.append({"type": "pointerUp"})
@@ -302,21 +327,22 @@ def swipe_path(indices):
         return r.status_code == 200
     except Exception: return False
 
-
 def _tier(w: str) -> int:
     n = len(w)
-    if n == 7: return 3
+    if n >= 7: return 3
     if n == 6: return 2
     if n == 5: return 1
     return 0
 
-
+# ─────────────────────────────────────────
+#  MAIN LOOP
+# ─────────────────────────────────────────
 def run():
     words, prefixes = load_dictionary(DICT_PATH)
 
-    print("\n" + "=" * 54)
-    print("   Boggle Bot  ⚡  Template Matching Edition")
-    print("=" * 54)
+    print("\n" + "=" * 60)
+    print("   Boggle Bot  ⚡  Dynamic Contour + Tesseract Edition")
+    print("=" * 60)
     get_session()
 
     played:            set[str] = set()
@@ -429,13 +455,7 @@ def run():
             print(f"  Error: {e}")
             time.sleep(2)
 
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Boggle Bot — Template Matching Edition")
-    parser.add_argument("--calibrate", action="store_true", help="Extract templates.")
+    parser = argparse.ArgumentParser(description="Boggle Bot — Dynamic Contour Edition")
     args = parser.parse_args()
-
-    if args.calibrate:
-        calibrate()
-    else:
-        run()
+    run()
