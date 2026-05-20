@@ -98,7 +98,7 @@ def _preprocess_for_tess(crop: np.ndarray) -> np.ndarray:
     - Adds a thick white border (Tesseract needs whitespace around char)
     """
     h = crop.shape[0]
-    crop = crop[:int(h * 0.75), :]                              # remove dot row
+    crop = crop[:int(h * 0.62), :]                              # remove dot row (cut 38% — covers tall-dot letters like I)
     large = cv2.resize(crop, (128, 128), interpolation=cv2.INTER_CUBIC)
     _, bw = cv2.threshold(large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if np.mean(bw) < 127:                                       # ensure white bg
