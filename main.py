@@ -48,7 +48,27 @@ COORD_SCALE  = 3.0    # physical px = WDA logical px × scale (3.0 for Retina)
 
 # ── Tesseract ──
 TEMPLATES_DIR = "templates"
-_TESS_CONFIG  = "--psm 10 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+# Multiple configs tried in order; first one to return a high-confidence letter wins
+_TESS_CONFIGS = [
+    "--psm 10 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ",  # single char
+    "--psm 8  --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ",  # single word
+    "--psm 6  --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ",  # uniform block
+]
+# Common OCR confusions → correct letter (handles I/O misreads specifically)
+_OCR_FIX = {
+    '0': 'O', 'Q': 'O',                          # O look-alikes
+    '1': 'I', '|': 'I', '!': 'I', 'L': 'I',     # I look-alikes (lowercase l → I handled below)
+    '@': 'A', '4': 'A',
+    '8': 'B',
+    '(': 'C', ')': 'C',
+    '3': 'E',
+    '6': 'G',
+    '5': 'S', '$': 'S',
+    '7': 'T',
+    '2': 'Z',
+}
+# Letters that are frequently shadowed by look-alikes — get an extra verify pass
+_AMBIGUOUS = {'I', 'O', 'B', 'E', 'G', 'S', 'Z'}
 
 # ── Dynamic Coordinates (Populated at Runtime) ──
 # Maps tile index (0-15) to its (x, y) logical WDA swipe coordinate
@@ -144,43 +164,98 @@ def find_dynamic_grid(img_grey: np.ndarray):
 #  TESSERACT OCR ENGINE
 # ─────────────────────────────────────────
 def _preprocess_for_tess(crop: np.ndarray) -> np.ndarray:
+    # ── 1. Boost local contrast with CLAHE (helps I/O in low-contrast tiles) ──
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+    crop  = clahe.apply(crop)
+
+    # ── 2. Sharpen to make thin strokes (like 'I') crisper ──
+    kernel_sharpen = np.array([[-1, -1, -1],
+                                [-1,  9, -1],
+                                [-1, -1, -1]])
+    crop = cv2.filter2D(crop, -1, kernel_sharpen)
+
+    # ── 3. Initial threshold to isolate the glyph ──
     _, bw_full = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # ── 4. Remove noise blobs smaller than 1% of tile area ──
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bw_full, connectivity=8)
     clean = np.zeros_like(bw_full)
     tile_area = crop.shape[0] * crop.shape[1]
-    
-    # Filter out small noise (like point dots)
     for lbl in range(1, n_labels):
-        if stats[lbl, cv2.CC_STAT_AREA] > tile_area * 0.01: 
+        if stats[lbl, cv2.CC_STAT_AREA] > tile_area * 0.01:
             clean[labels == lbl] = 255
-            
-    crop = cv2.bitwise_not(clean)
-    large = cv2.resize(crop, (128, 128), interpolation=cv2.INTER_CUBIC)
+
+    # ── 5. Scale up larger (192 → better than 128 for thin letters like I) ──
+    inverted = cv2.bitwise_not(clean)
+    large    = cv2.resize(inverted, (192, 192), interpolation=cv2.INTER_CUBIC)
+
+    # ── 6. Re-threshold after resize to clean up interpolation artifacts ──
     _, bw = cv2.threshold(large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if np.mean(bw) < 127:                                       
+
+    # ── 7. Ensure black text on white background (Tesseract default) ──
+    if np.mean(bw) < 127:
         bw = cv2.bitwise_not(bw)
-    return cv2.copyMakeBorder(bw, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=255)
+
+    # ── 8. Generous border so Tesseract doesn't clip edge letters ──
+    return cv2.copyMakeBorder(bw, 40, 40, 40, 40, cv2.BORDER_CONSTANT, value=255)
+
+def _ocr_with_confidence(pil: Image.Image) -> tuple[str, float]:
+    """
+    Try each Tesseract config in order. Returns (letter, confidence).
+    Uses image_to_data so we can pick the highest-confidence valid result.
+    """
+    best_letter = None
+    best_conf   = -1.0
+
+    for cfg in _TESS_CONFIGS:
+        try:
+            data = pytesseract.image_to_data(pil, config=cfg, output_type=pytesseract.Output.DICT)
+            for txt, conf in zip(data["text"], data["conf"]):
+                txt  = txt.strip().upper()
+                conf = float(conf)
+                # Apply correction map before checking validity
+                txt = "".join(_OCR_FIX.get(c, c) for c in txt)
+                letter = next((c for c in txt if c.isalpha() and c.isupper()), None)
+                if letter and conf > best_conf:
+                    best_letter = letter
+                    best_conf   = conf
+        except Exception:
+            continue
+
+    return (best_letter or "?", best_conf)
+
 
 def _read_tile(img_grey: np.ndarray, box: tuple, idx: int) -> str:
     x, y, w, h = box
-    
-    # Shrink the box by 10% to completely eliminate the outer tile border from the crop
+
+    # Shrink by 10% to strip the outer tile border
     margin_x = int(w * 0.1)
     margin_y = int(h * 0.1)
     crop = img_grey[y + margin_y : y + h - margin_y, x + margin_x : x + w - margin_x]
-    
+
     if crop.size == 0:
         return "?"
 
     ready = _preprocess_for_tess(crop)
     pil   = Image.fromarray(ready)
-    raw   = pytesseract.image_to_string(pil, config=_TESS_CONFIG).strip().upper()
 
-    letter = next((c for c in raw if c.isalpha()), None)
-    if letter:
-        return letter.lower()
+    letter, conf = _ocr_with_confidence(pil)
 
-    return "?"
+    # ── Low-confidence fallback: try adaptive threshold variant ──
+    if conf < 60 or letter == "?":
+        adaptive = cv2.adaptiveThreshold(
+            crop, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 10
+        )
+        large2 = cv2.resize(adaptive, (192, 192), interpolation=cv2.INTER_CUBIC)
+        if np.mean(large2) < 127:
+            large2 = cv2.bitwise_not(large2)
+        bordered2 = cv2.copyMakeBorder(large2, 40, 40, 40, 40, cv2.BORDER_CONSTANT, value=255)
+        pil2 = Image.fromarray(bordered2)
+        letter2, conf2 = _ocr_with_confidence(pil2)
+        if conf2 > conf and letter2 != "?":
+            letter, conf = letter2, conf2
+
+    return letter.lower() if letter and letter != "?" else "?"
 
 def ocr_board(img: Image.Image) -> list:
     global DYNAMIC_TILE_COORDS
