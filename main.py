@@ -98,7 +98,16 @@ def _preprocess_for_tess(crop: np.ndarray) -> np.ndarray:
     - Adds a thick white border (Tesseract needs whitespace around char)
     """
     h = crop.shape[0]
-    crop = crop[:int(h * 0.62), :]                              # remove dot row (cut 38% — covers tall-dot letters like I)
+    # Remove point-value dots smartly: erase small connected blobs, keep the letter body
+    _, bw_full = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bw_full, connectivity=8)
+    clean = np.zeros_like(bw_full)
+    tile_area = crop.shape[0] * crop.shape[1]
+    for lbl in range(1, n_labels):
+        if stats[lbl, cv2.CC_STAT_AREA] > tile_area * 0.01:   # keep blobs > 1% of tile
+            clean[labels == lbl] = 255
+    # convert back to white-bg black-letter
+    crop = cv2.bitwise_not(clean)
     large = cv2.resize(crop, (128, 128), interpolation=cv2.INTER_CUBIC)
     _, bw = cv2.threshold(large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if np.mean(bw) < 127:                                       # ensure white bg
