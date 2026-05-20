@@ -105,9 +105,53 @@ _TESS_CONFIGS = [
 ]
 
 
-def load_templates(folder: str = None) -> None:
-    """No-op — Tesseract needs no pre-loaded templates."""
-    print("  [OCR] Tesseract mode — no templates required.")
+# ── Auto-template cache (built automatically, persisted to disk) ──────────────
+_auto_templates: dict = {}   # letter → float32 binary array for NCC matching
+_TMPL_MATCH_THRESHOLD = 0.82  # NCC score to trust template over Tesseract
+TEMPLATES_DIR = "templates"
+
+
+def _canonical_preprocess(crop: np.ndarray) -> np.ndarray:
+    """
+    Single stable preprocessing used for BOTH saving and matching templates.
+    Otsu (no CLAHE) is most stable across tile colours — consistent enough
+    that the same letter always produces nearly identical binary images.
+    """
+    large    = cv2.resize(crop, (SIDE * 3, SIDE * 3), interpolation=cv2.INTER_CUBIC)
+    _, bw    = cv2.threshold(large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(bw) < 127:
+        bw = cv2.bitwise_not(bw)
+    return cv2.copyMakeBorder(bw, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+
+
+def load_templates(folder: str = TEMPLATES_DIR) -> None:
+    """
+    Load any previously auto-saved templates from disk.
+    Files are named by letter (A.png … Z.png, QU.png) and were written by
+    _save_template() — no manual renaming ever needed.
+    """
+    global _auto_templates
+    os.makedirs(folder, exist_ok=True)
+    loaded = {}
+    for fname in os.listdir(folder):
+        name, ext = os.path.splitext(fname)
+        if ext.lower() not in (".png", ".jpg", ".jpeg"):
+            continue
+        label = name.upper()
+        path  = os.path.join(folder, fname)
+        img   = Image.open(path).convert("L").resize((SIDE * 3 + 40, SIDE * 3 + 40), Image.LANCZOS)
+        loaded[label.lower()] = np.array(img, dtype=np.float32)
+    _auto_templates = loaded
+    if loaded:
+        print(f"  [OCR] Loaded {len(loaded)} auto-templates: {sorted(k.upper() for k in loaded)}")
+    else:
+        print(f"  [OCR] No templates yet — Tesseract will build them automatically.")
+
+
+def _save_template(letter: str, bw: np.ndarray) -> None:
+    """Persist a new template to disk so future runs skip Tesseract for this letter."""
+    path = os.path.join(TEMPLATES_DIR, f"{letter.upper()}.png")
+    cv2.imwrite(path, bw)
 
 
 def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
@@ -122,7 +166,6 @@ def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
 
 
 def _add_border(bw: np.ndarray) -> np.ndarray:
-    """Add white border so Tesseract doesn't clip edge letters."""
     return cv2.copyMakeBorder(bw, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
 
 
@@ -130,54 +173,28 @@ def _ensure_dark_on_light(bw: np.ndarray) -> np.ndarray:
     return cv2.bitwise_not(bw) if np.mean(bw) < 127 else bw
 
 
-def _preprocess_variants(crop: np.ndarray) -> list:
-    """
-    Return several preprocessed versions of the same crop.
-    Tesseract is tried on each; whichever yields the highest confidence wins.
-    This prevents any single preprocessing failure (e.g. over-aggressive CLAHE
-    destroying thin strokes in E or L) from silently returning '?'.
-
-    Variants:
-      1. CLAHE + Otsu          — handles coloured tile backgrounds
-      2. Otsu only             — simpler; works when contrast is already good
-      3. Adaptive threshold    — robust when letter/background are similar tone
-      4. Fixed threshold @127  — last-resort fallback on very high-contrast crops
-    """
+def _tess_variants(crop: np.ndarray) -> list:
+    """4 preprocessing variants tried only when template matching fails."""
     large = cv2.resize(crop, (SIDE * 3, SIDE * 3), interpolation=cv2.INTER_CUBIC)
-    results = []
-
-    # Variant 1: CLAHE + Otsu
+    out   = []
+    # 1. CLAHE + Otsu
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
-    eq    = clahe.apply(large)
-    _, v1 = cv2.threshold(eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    results.append(_add_border(_ensure_dark_on_light(v1)))
-
-    # Variant 2: Otsu only (no CLAHE)
+    _, v1 = cv2.threshold(clahe.apply(large), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    out.append(_add_border(_ensure_dark_on_light(v1)))
+    # 2. Otsu only
     _, v2 = cv2.threshold(large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    results.append(_add_border(_ensure_dark_on_light(v2)))
-
-    # Variant 3: Adaptive threshold (handles uneven lighting across tile)
+    out.append(_add_border(_ensure_dark_on_light(v2)))
+    # 3. Adaptive
     blurred = cv2.GaussianBlur(large, (3, 3), 0)
-    v3 = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 31, 10
-    )
-    results.append(_add_border(_ensure_dark_on_light(v3)))
-
-    # Variant 4: Fixed threshold @127 (clean screenshots are already high-contrast)
+    v3 = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10)
+    out.append(_add_border(_ensure_dark_on_light(v3)))
+    # 4. Fixed @127
     _, v4 = cv2.threshold(large, 127, 255, cv2.THRESH_BINARY)
-    results.append(_add_border(_ensure_dark_on_light(v4)))
-
-    return results
-
-
-def _preprocess_tile(crop: np.ndarray) -> np.ndarray:
-    """Return the primary preprocessed image (CLAHE+Otsu). Used by _disambiguate."""
-    return _preprocess_variants(crop)[0]
+    out.append(_add_border(_ensure_dark_on_light(v4)))
+    return out
 
 
 def _parse_tess_result(text: str) -> str:
-    """Normalise Tesseract output to a single letter or 'qu'."""
     t = text.strip().upper()
     if t in ("Q", "QU"):
         return "qu"
@@ -187,34 +204,14 @@ def _parse_tess_result(text: str) -> str:
 
 
 def _count_holes(bw: np.ndarray) -> int:
-    """
-    Count enclosed regions (topological holes) in a binary tile image.
-    Letter is dark (0) on white (255) background.
-
-    Hole counts per letter (typical sans-serif font):
-      0 holes → C E F G H I J K L M N S T U V W X Y Z
-      1 hole  → A D O P Q R
-      2 holes → B
-    """
     inv = cv2.bitwise_not(bw)
     _, hierarchy = cv2.findContours(inv, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
     if hierarchy is None:
         return 0
-    # Inner contours have a parent (hierarchy[0][i][3] != -1)
     return sum(1 for h in hierarchy[0] if h[3] != -1)
 
 
 def _disambiguate(letter: str, bw: np.ndarray) -> str:
-    """
-    Fix the two most common game-font confusions using topology.
-    Hole counting is font-size-invariant and works on any clean binary image.
-
-      I vs P: Tesseract often reads I as P.
-              P has 1 hole (enclosed bump) — I has 0.
-
-      A vs N: Tesseract often reads A as N.
-              A has 1 hole (enclosed triangle) — N has 0.
-    """
     if letter in ("i", "p"):
         return "p" if _count_holes(bw) >= 1 else "i"
     if letter in ("a", "n"):
@@ -222,44 +219,75 @@ def _disambiguate(letter: str, bw: np.ndarray) -> str:
     return letter
 
 
+def _template_match(canonical: np.ndarray) -> tuple:
+    """
+    Compare canonical crop against all loaded templates via NCC.
+    Returns (best_letter, best_score). Score < _TMPL_MATCH_THRESHOLD → no match.
+    """
+    if not _auto_templates:
+        return "", -1.0
+    cf = canonical.astype(np.float32)
+    best_letter, best_score = "", -1.0
+    for letter, tmpl in _auto_templates.items():
+        if tmpl.shape != cf.shape:
+            continue
+        score = float(cv2.matchTemplate(cf, tmpl, cv2.TM_CCOEFF_NORMED)[0, 0])
+        if score > best_score:
+            best_score, best_letter = score, letter
+    return best_letter, best_score
+
+
+def _tesseract_read(crop: np.ndarray) -> tuple:
+    """
+    Run Tesseract across all variants × configs.
+    Returns (best_letter, best_conf, best_img).
+    """
+    best_letter, best_conf, best_img = "", -1.0, None
+    for img in _tess_variants(crop):
+        for cfg in _TESS_CONFIGS:
+            try:
+                data = pytesseract.image_to_data(img, config=cfg,
+                                                  output_type=pytesseract.Output.DICT)
+                for text, conf in zip(data["text"], data["conf"]):
+                    letter = _parse_tess_result(text)
+                    if letter and float(conf) > best_conf:
+                        best_conf, best_letter, best_img = float(conf), letter, img
+            except Exception:
+                continue
+    return best_letter, best_conf, best_img
+
+
 def _read_tile(img_grey: np.ndarray, idx: int) -> str:
     """
-    OCR one tile:
-    1. Try every combination of preprocessing variant × Tesseract config.
-    2. Pick the result with the highest confidence score.
-    3. Run topology disambiguation to fix I/P and A/N confusions.
-    Falls back to '?' only if every combination fails.
+    Fast path  → template matching  (~0.1 ms, used once letter has been seen before)
+    Slow path  → Tesseract          (~80 ms, used only for unseen letters)
+    New letter → disambiguate + save to disk so next run uses fast path immediately.
     """
     crop = _crop_tile(img_grey, idx)
     if crop.size == 0:
         return "?"
 
-    variants    = _preprocess_variants(crop)
-    best_letter = ""
-    best_conf   = -1.0
-    best_img    = variants[0]   # used for disambiguation
+    canonical = _canonical_preprocess(crop)
 
-    for img in variants:
-        for cfg in _TESS_CONFIGS:
-            try:
-                data = pytesseract.image_to_data(
-                    img, config=cfg,
-                    output_type=pytesseract.Output.DICT
-                )
-                for text, conf in zip(data["text"], data["conf"]):
-                    letter = _parse_tess_result(text)
-                    if letter and float(conf) > best_conf:
-                        best_conf   = float(conf)
-                        best_letter = letter
-                        best_img    = img
-            except Exception:
-                continue
+    # ── Fast path: template matching ─────────────────────────────────────────
+    letter, score = _template_match(canonical)
+    if score >= _TMPL_MATCH_THRESHOLD:
+        return letter   # microseconds, no Tesseract involved
 
-    if not best_letter:
+    # ── Slow path: Tesseract ──────────────────────────────────────────────────
+    letter, _, best_img = _tesseract_read(crop)
+    if not letter:
         return "?"
 
-    # Fix I/P and A/N using hole counting — topology never lies
-    return _disambiguate(best_letter, best_img)
+    if best_img is not None:
+        letter = _disambiguate(letter, best_img)
+
+    # Cache for this run + save to disk for future runs
+    _auto_templates[letter] = canonical.astype(np.float32)
+    _save_template(letter, canonical)
+    print(f"  [OCR] Auto-saved template for '{letter.upper()}'")
+
+    return letter
 
 
 def ocr_board(img: Image.Image) -> list:
