@@ -49,8 +49,12 @@ TILE_CROP_PX = 100    # half-side of square crop around each tile centre
 
 # ── Tesseract ──
 TEMPLATES_DIR = "templates"   # kept for calibrate() debug saves
-_TESS_CONFIG  = "--psm 10 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_TESS_CONFIG          = "--psm 10 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_TESS_CONFIG_FALLBACK = "--psm 10 --oem 3"   # no whitelist → lets digits/symbols through for "I" recovery
 # psm 10 = single character mode; whitelist prevents digit/symbol confusion
+
+# Characters Tesseract commonly returns instead of "I" (thin vertical stroke)
+_I_LOOKALIKES = {"1", "l", "|", "!", "/", "\\", "i"}
 
 # ── 4×4 board tile coordinates (WDA logical px) ──
 TILE_COORDS = {
@@ -104,7 +108,7 @@ def _preprocess_for_tess(crop: np.ndarray) -> np.ndarray:
     clean = np.zeros_like(bw_full)
     tile_area = crop.shape[0] * crop.shape[1]
     for lbl in range(1, n_labels):
-        if stats[lbl, cv2.CC_STAT_AREA] > tile_area * 0.01:   # keep blobs > 1% of tile
+        if stats[lbl, cv2.CC_STAT_AREA] > tile_area * 0.004:  # keep blobs > 0.4% of tile (lower for thin "I")
             clean[labels == lbl] = 255
     # convert back to white-bg black-letter
     crop = cv2.bitwise_not(clean)
@@ -139,6 +143,15 @@ def _read_tile(img_grey: np.ndarray, idx: int) -> str:
     letter = next((c for c in raw if c.isalpha()), None)
     if letter:
         return letter.lower()
+
+    # ── "I" fallback ─────────────────────────────────────────────────────────
+    # "I" is a thin vertical stroke — Tesseract in PSM 10 often returns "1",
+    # "|", "l", etc. or nothing at all.  Run a second pass without the letter
+    # whitelist so those lookalike characters can come through, then remap them.
+    raw_fb = pytesseract.image_to_string(pil, config=_TESS_CONFIG_FALLBACK).strip()
+    if len(raw_fb) == 1 and raw_fb in _I_LOOKALIKES:
+        return "i"
+    # ─────────────────────────────────────────────────────────────────────────
 
     print(f"  [OCR] No read at tile {idx:02d} (raw: {repr(raw)})")
     return "?"
