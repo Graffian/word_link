@@ -1,17 +1,16 @@
 """
-Boggle Bot — Shift-Tolerant Template Matching Edition
+Boggle Bot — Tesseract OCR Edition
 ──────────────────────────────────────────────────────────────────────────
 Pipeline:
   1. Screenshot via WebDriverAgent
-  2. Crop each board tile → Shift-tolerant Template Matching → letter (A-Z or QU)
+  2. Crop each board tile → Tesseract OCR (single-char mode) → letter (A-Z)
   3. DFS solver over the curated dictionary
   4. Swipe the best word's tile path on the board
   5. Repeat on new board
 
 Requirements:
-  pip install pillow numpy requests opencv-python
-
-No Tesseract binary required!
+  pip install pillow numpy requests opencv-python pytesseract
+  brew install tesseract   (or apt install tesseract-ocr)
 """
 
 import argparse
@@ -22,6 +21,7 @@ import os
 import threading
 import numpy as np
 import cv2
+import pytesseract
 from PIL import Image
 from io import BytesIO
 
@@ -47,9 +47,10 @@ MAX_WORD_LEN = 7
 COORD_SCALE  = 3.0    # physical px = WDA logical px × scale (3.0 for Retina)
 TILE_CROP_PX = 100    # half-side of square crop around each tile centre
 
-# ── Template matching ──
-TEMPLATES_DIR         = "templates"
-_TMPL_MATCH_THRESHOLD = 0.70  # Perfect fits yield > 0.95. Anything below 0.85 is unrecognized.
+# ── Tesseract ──
+TEMPLATES_DIR = "templates"   # kept for calibrate() debug saves
+_TESS_CONFIG  = "--psm 10 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+# psm 10 = single character mode; whitelist prevents digit/symbol confusion
 
 # ── 4×4 board tile coordinates (WDA logical px) ──
 TILE_COORDS = {
@@ -85,39 +86,24 @@ def tile_score(word: str) -> int:
 
 
 # ─────────────────────────────────────────
-#  SHIFTS-TOLERANT MATCHING ENGINE
+#  TESSERACT OCR ENGINE
 # ─────────────────────────────────────────
-SIDE = TILE_CROP_PX * 2
-_auto_templates: dict = {}
 
-
-def _canonical_preprocess(crop: np.ndarray) -> np.ndarray:
-    """Creates a standardized binary canvas layout matching reference files."""
-    large    = cv2.resize(crop, (SIDE * 3, SIDE * 3), interpolation=cv2.INTER_CUBIC)
-    _, bw    = cv2.threshold(large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if np.mean(bw) < 127:
+def _preprocess_for_tess(crop: np.ndarray) -> np.ndarray:
+    """
+    Prepares a tile crop for Tesseract single-char recognition.
+    - Drops the bottom 25% of the tile to cut off point-value dots
+    - Upscales to 128×128 (Tesseract accuracy degrades below ~32px)
+    - Otsu binarise → white background, black letter
+    - Adds a thick white border (Tesseract needs whitespace around char)
+    """
+    h = crop.shape[0]
+    crop = crop[:int(h * 0.75), :]                              # remove dot row
+    large = cv2.resize(crop, (128, 128), interpolation=cv2.INTER_CUBIC)
+    _, bw = cv2.threshold(large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(bw) < 127:                                       # ensure white bg
         bw = cv2.bitwise_not(bw)
-    return cv2.copyMakeBorder(bw, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
-
-
-def load_templates(folder: str = TEMPLATES_DIR) -> None:
-    """Loads your manually named alphabet files from disk into memory."""
-    global _auto_templates
-    os.makedirs(folder, exist_ok=True)
-    loaded = {}
-    for fname in os.listdir(folder):
-        name, ext = os.path.splitext(fname)
-        if ext.lower() not in (".png", ".jpg", ".jpeg") or name.startswith("tile_"):
-            continue
-        label = name.upper()
-        path  = os.path.join(folder, fname)
-        img   = Image.open(path).convert("L").resize((SIDE * 3 + 40, SIDE * 3 + 40), Image.LANCZOS)
-        loaded[label.lower()] = np.array(img, dtype=np.float32)
-    _auto_templates = loaded
-    if loaded:
-        print(f"  [OCR] Loaded {len(loaded)} curated templates: {sorted(k.upper() for k in loaded)}")
-    else:
-        print(f"  [WARNING] No letter templates found! Please rename tile_xx.png files to letters (e.g., A.png)")
+    return cv2.copyMakeBorder(bw, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=255)
 
 
 def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
@@ -131,41 +117,21 @@ def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
     return img_grey[y1:y2, x1:x2]
 
 
-def _template_match(canonical: np.ndarray) -> tuple:
-    """Slides the master templates across a padded tile area to handle shifts."""
-    if not _auto_templates:
-        return "", -1.0
-    
-    # Pad search area by 12px to let templates safely slide if coordinates bounce
-    search_area = cv2.copyMakeBorder(canonical, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255)
-    search_area = search_area.astype(np.float32)
-    
-    best_letter, best_score = "", -1.0
-    for letter, tmpl in _auto_templates.items():
-        if tmpl.shape != canonical.shape:
-            continue
-            
-        res = cv2.matchTemplate(search_area, tmpl, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, _ = cv2.minMaxLoc(res)
-        
-        if max_val > best_score:
-            best_score, best_letter = max_val, letter
-            
-    return best_letter, best_score
-
-
 def _read_tile(img_grey: np.ndarray, idx: int) -> str:
     crop = _crop_tile(img_grey, idx)
     if crop.size == 0:
         return "?"
 
-    canonical = _canonical_preprocess(crop)
-    letter, score = _template_match(canonical)
-    
-    if score >= _TMPL_MATCH_THRESHOLD:
-        return letter
+    ready = _preprocess_for_tess(crop)
+    pil   = Image.fromarray(ready)
+    raw   = pytesseract.image_to_string(pil, config=_TESS_CONFIG).strip().upper()
 
-    print(f"  [OCR] Unknown character layout at tile {idx:02d} (Best guess: '{letter.upper()}' @ {score:.2f})")
+    # keep only the first valid letter (Tesseract sometimes returns trailing noise)
+    letter = next((c for c in raw if c.isalpha()), None)
+    if letter:
+        return letter.lower()
+
+    print(f"  [OCR] No read at tile {idx:02d} (raw: {repr(raw)})")
     return "?"
 
 
@@ -175,7 +141,7 @@ def ocr_board(img: Image.Image) -> list:
     letters = [_read_tile(img_grey, i) for i in range(16)]
 
     rows = [" ".join(f"{letters[r*4+c].upper():>2}" for c in range(4)) for r in range(4)]
-    print(f"  OCR[Match]: {rows[0]}")
+    print(f"  OCR[Tess]:  {rows[0]}")
     for row in rows[1:]:
         print(f"              {row}")
     return letters
@@ -196,9 +162,9 @@ def calibrate():
         crop = _crop_tile(img_grey, i)
         if crop.size == 0:
             continue
-        canonical = _canonical_preprocess(crop)
-        out_path  = os.path.join(TEMPLATES_DIR, f"tile_{i:02d}.png")
-        cv2.imwrite(out_path, canonical)
+        ready    = _preprocess_for_tess(crop)
+        out_path = os.path.join(TEMPLATES_DIR, f"tile_{i:02d}.png")
+        cv2.imwrite(out_path, ready)
         
     print(f"\n  Saved 16 processed crops to ./{TEMPLATES_DIR}/")
     print("  Please map these files to true letters (e.g., rename tile_00.png -> A.png)")
@@ -337,7 +303,6 @@ def _tier(w: str) -> int:
 
 
 def run():
-    load_templates()
     words, prefixes = load_dictionary(DICT_PATH)
 
     print("\n" + "=" * 54)
