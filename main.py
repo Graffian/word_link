@@ -49,7 +49,7 @@ TILE_CROP_PX = 100    # half-side of square crop around each tile centre
 
 # ── Template matching ──
 TEMPLATES_DIR         = "templates"
-_TMPL_MATCH_THRESHOLD = 0.85  # Perfect fits yield > 0.95. Anything below 0.85 is unrecognized.
+_TMPL_MATCH_THRESHOLD = 0.70  # Perfect fits yield > 0.95. Anything below 0.85 is unrecognized.
 
 # ── 4×4 board tile coordinates (WDA logical px) ──
 TILE_COORDS = {
@@ -111,10 +111,8 @@ def load_templates(folder: str = TEMPLATES_DIR) -> None:
             continue
         label = name.upper()
         path  = os.path.join(folder, fname)
-        img   = Image.open(path).convert("L")
-        arr   = np.array(img, dtype=np.uint8)
-        canonical = _canonical_preprocess(arr)          # same pipeline as live crops
-        loaded[label.lower()] = canonical.astype(np.float32)
+        img   = Image.open(path).convert("L").resize((SIDE * 3 + 40, SIDE * 3 + 40), Image.LANCZOS)
+        loaded[label.lower()] = np.array(img, dtype=np.float32)
     _auto_templates = loaded
     if loaded:
         print(f"  [OCR] Loaded {len(loaded)} curated templates: {sorted(k.upper() for k in loaded)}")
