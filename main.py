@@ -146,18 +146,54 @@ def _parse_tess_result(text: str) -> str:
     return ""
 
 
+def _count_holes(bw: np.ndarray) -> int:
+    """
+    Count enclosed regions (topological holes) in a binary tile image.
+    Letter is dark (0) on white (255) background.
+
+    Hole counts per letter (typical sans-serif font):
+      0 holes → C E F G H I J K L M N S T U V W X Y Z
+      1 hole  → A D O P Q R
+      2 holes → B
+    """
+    inv = cv2.bitwise_not(bw)
+    _, hierarchy = cv2.findContours(inv, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return 0
+    # Inner contours have a parent (hierarchy[0][i][3] != -1)
+    return sum(1 for h in hierarchy[0] if h[3] != -1)
+
+
+def _disambiguate(letter: str, bw: np.ndarray) -> str:
+    """
+    Fix the two most common game-font confusions using topology.
+    Hole counting is font-size-invariant and works on any clean binary image.
+
+      I vs P: Tesseract often reads I as P.
+              P has 1 hole (enclosed bump) — I has 0.
+
+      A vs N: Tesseract often reads A as N.
+              A has 1 hole (enclosed triangle) — N has 0.
+    """
+    if letter in ("i", "p"):
+        return "p" if _count_holes(bw) >= 1 else "i"
+    if letter in ("a", "n"):
+        return "a" if _count_holes(bw) >= 1 else "n"
+    return letter
+
+
 def _read_tile(img_grey: np.ndarray, idx: int) -> str:
     """
-    OCR one tile using multiple Tesseract configs.
-    Each config returns a (letter, confidence) pair via image_to_data;
-    the result with the highest confidence is used.
+    OCR one tile:
+    1. Try all Tesseract configs, pick highest-confidence result.
+    2. Run topology disambiguation to fix I/P and A/N confusions.
     Falls back to '?' only if every config fails.
     """
     crop = _crop_tile(img_grey, idx)
     if crop.size == 0:
         return "?"
 
-    processed = _preprocess_tile(crop)
+    processed   = _preprocess_tile(crop)
     best_letter = ""
     best_conf   = -1.0
 
@@ -175,7 +211,11 @@ def _read_tile(img_grey: np.ndarray, idx: int) -> str:
         except Exception:
             continue
 
-    return best_letter if best_letter else "?"
+    if not best_letter:
+        return "?"
+
+    # Fix I/P and A/N using hole counting — topology never lies
+    return _disambiguate(best_letter, processed)
 
 
 def ocr_board(img: Image.Image) -> list:
