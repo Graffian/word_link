@@ -211,7 +211,7 @@ def _ocr_cv(img_np: np.ndarray) -> list[str]:
 
 
 def _ocr_claude(img: Image.Image, img_np: np.ndarray,
-                tile_indices: list[int] | None = None) -> list[str]:
+                tile_indices = None) -> list[str]:
     indices = tile_indices if tile_indices is not None else list(range(16))
     buf     = BytesIO()
     img.save(buf, format="JPEG", quality=85)
