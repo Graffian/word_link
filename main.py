@@ -7,7 +7,10 @@ import os
 import numpy as np
 from PIL import Image
 from io import BytesIO
+from dotenv import load_dotenv
 import anthropic
+
+load_dotenv()
 
 # ─────────────────────────────────────────
 #  CONFIGURATION
