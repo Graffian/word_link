@@ -41,7 +41,7 @@ MAX_WORD_LEN = 7
 
 # ── Crop ──
 COORD_SCALE = 3.0     # physical px = WDA logical px × scale (3.0 for Retina)
-TILE_CROP_PX = 60     # half-side of square crop around each tile centre
+TILE_CROP_PX = 100     # half-side of square crop around each tile centre
 
 # ── 4×4 board tile coordinates (WDA logical px) ──
 TILE_COORDS = {
