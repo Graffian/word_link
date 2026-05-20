@@ -45,7 +45,7 @@ MAX_WORD_LEN = 7
 CNN_INPUT_SIZE = 32      # model expects 32×32 grayscale
 CNN_CONFIDENCE = 0.55    # tiles below this threshold → "?"
 COORD_SCALE    = 3.0     # physical px = WDA logical px × scale (3.0 for Retina)
-TILE_CROP_PX   = 75      # half-side of square crop around each tile centre
+TILE_CROP_PX   = 100      # half-side of square crop around each tile centre
 
 # CNN_CLASSES is loaded from CLASSES_PATH at startup — do not hardcode here.
 CNN_CLASSES: list[str] = []
