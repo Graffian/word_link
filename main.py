@@ -111,8 +111,10 @@ def load_templates(folder: str = TEMPLATES_DIR) -> None:
             continue
         label = name.upper()
         path  = os.path.join(folder, fname)
-        img   = Image.open(path).convert("L").resize((SIDE * 3 + 40, SIDE * 3 + 40), Image.LANCZOS)
-        loaded[label.lower()] = np.array(img, dtype=np.float32)
+        img   = Image.open(path).convert("L")
+        arr   = np.array(img, dtype=np.uint8)
+        canonical = _canonical_preprocess(arr)          # same pipeline as live crops
+        loaded[label.lower()] = canonical.astype(np.float32)
     _auto_templates = loaded
     if loaded:
         print(f"  [OCR] Loaded {len(loaded)} curated templates: {sorted(k.upper() for k in loaded)}")
