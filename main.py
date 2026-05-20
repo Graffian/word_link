@@ -22,7 +22,7 @@ import os
 import threading
 import numpy as np
 import cv2
-import coremltools as ct
+import pytesseract
 from PIL import Image
 from io import BytesIO
 
@@ -46,17 +46,29 @@ MAX_WORD_LEN = 7
 # ── Crop & Scale ──
 COORD_SCALE  = 3.0    # physical px = WDA logical px × scale (3.0 for Retina)
 
-# ── CNN Tile Classifier ──
-CNN_MODEL_PATH = "WordLinkTileCNN_rebuilt.mlmodel"
-
-# Class list must match WordLinkTileClasses.json exactly:
-# A-Z with QU inserted at index 16 (between P and R)
-_CNN_CLASSES = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-_CNN_CLASSES.insert(16, "QU")   # index 16 = QU, index 17+ shifts R-Z
-
-print(f"Loading CNN model from '{CNN_MODEL_PATH}' ...")
-_CNN_MODEL = ct.models.MLModel(CNN_MODEL_PATH)
-print("  CNN model ready")
+# ── Tesseract ──
+TEMPLATES_DIR = "templates"
+# Multiple configs tried in order; first one to return a high-confidence letter wins
+_TESS_CONFIGS = [
+    "--psm 10 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ",  # single char
+    "--psm 8  --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ",  # single word
+    "--psm 6  --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ",  # uniform block
+]
+# Common OCR confusions → correct letter (handles I/O misreads specifically)
+_OCR_FIX = {
+    '0': 'O', 'Q': 'O',                          # O look-alikes
+    '1': 'I', '|': 'I', '!': 'I', 'L': 'I',     # I look-alikes (lowercase l → I handled below)
+    '@': 'A', '4': 'A',
+    '8': 'B',
+    '(': 'C', ')': 'C',
+    '3': 'E',
+    '6': 'G',
+    '5': 'S', '$': 'S',
+    '7': 'T',
+    '2': 'Z',
+}
+# Letters that are frequently shadowed by look-alikes — get an extra verify pass
+_AMBIGUOUS = {'I', 'O', 'B', 'E', 'G', 'S', 'Z'}
 
 # ── Dynamic Coordinates (Populated at Runtime) ──
 # Maps tile index (0-15) to its (x, y) logical WDA swipe coordinate
@@ -151,20 +163,72 @@ def find_dynamic_grid(img_grey: np.ndarray):
 # ─────────────────────────────────────────
 #  TESSERACT OCR ENGINE
 # ─────────────────────────────────────────
-def _read_tile(img_grey: np.ndarray, box: tuple, idx: int) -> str:
-    """
-    Classifies a single tile using the WordLink CNN (.mlmodel).
+def _preprocess_for_tess(crop: np.ndarray) -> np.ndarray:
+    # ── 1. Boost local contrast with CLAHE (helps I/O in low-contrast tiles) ──
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+    crop  = clahe.apply(crop)
 
-    Pipeline:
-      1. Crop tile with 10% margin to strip the outer border.
-      2. Resize to 32x32 (the model's expected input size).
-      3. Normalise pixel values to [0, 1] as float32.
-      4. Run CoreML inference → pick argmax over 27 logits (A-Z + QU).
-      5. Return the letter in lowercase (or 'qu' for the QU tile).
+    # ── 2. Sharpen to make thin strokes (like 'I') crisper ──
+    kernel_sharpen = np.array([[-1, -1, -1],
+                                [-1,  9, -1],
+                                [-1, -1, -1]])
+    crop = cv2.filter2D(crop, -1, kernel_sharpen)
+
+    # ── 3. Initial threshold to isolate the glyph ──
+    _, bw_full = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # ── 4. Remove noise blobs smaller than 1% of tile area ──
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bw_full, connectivity=8)
+    clean = np.zeros_like(bw_full)
+    tile_area = crop.shape[0] * crop.shape[1]
+    for lbl in range(1, n_labels):
+        if stats[lbl, cv2.CC_STAT_AREA] > tile_area * 0.01:
+            clean[labels == lbl] = 255
+
+    # ── 5. Scale up larger (192 → better than 128 for thin letters like I) ──
+    inverted = cv2.bitwise_not(clean)
+    large    = cv2.resize(inverted, (192, 192), interpolation=cv2.INTER_CUBIC)
+
+    # ── 6. Re-threshold after resize to clean up interpolation artifacts ──
+    _, bw = cv2.threshold(large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # ── 7. Ensure black text on white background (Tesseract default) ──
+    if np.mean(bw) < 127:
+        bw = cv2.bitwise_not(bw)
+
+    # ── 8. Generous border so Tesseract doesn't clip edge letters ──
+    return cv2.copyMakeBorder(bw, 40, 40, 40, 40, cv2.BORDER_CONSTANT, value=255)
+
+def _ocr_with_confidence(pil: Image.Image) -> tuple[str, float]:
     """
+    Try each Tesseract config in order. Returns (letter, confidence).
+    Uses image_to_data so we can pick the highest-confidence valid result.
+    """
+    best_letter = None
+    best_conf   = -1.0
+
+    for cfg in _TESS_CONFIGS:
+        try:
+            data = pytesseract.image_to_data(pil, config=cfg, output_type=pytesseract.Output.DICT)
+            for txt, conf in zip(data["text"], data["conf"]):
+                txt  = txt.strip().upper()
+                conf = float(conf)
+                # Apply correction map before checking validity
+                txt = "".join(_OCR_FIX.get(c, c) for c in txt)
+                letter = next((c for c in txt if c.isalpha() and c.isupper()), None)
+                if letter and conf > best_conf:
+                    best_letter = letter
+                    best_conf   = conf
+        except Exception:
+            continue
+
+    return (best_letter or "?", best_conf)
+
+
+def _read_tile(img_grey: np.ndarray, box: tuple, idx: int) -> str:
     x, y, w, h = box
 
-    # Strip outer border (10% each side)
+    # Shrink by 10% to strip the outer tile border
     margin_x = int(w * 0.1)
     margin_y = int(h * 0.1)
     crop = img_grey[y + margin_y : y + h - margin_y, x + margin_x : x + w - margin_x]
@@ -172,19 +236,26 @@ def _read_tile(img_grey: np.ndarray, box: tuple, idx: int) -> str:
     if crop.size == 0:
         return "?"
 
-    # Resize to model input size and normalise
-    tile_32 = cv2.resize(crop, (32, 32), interpolation=cv2.INTER_AREA)
-    tensor  = tile_32.astype(np.float32) / 255.0          # shape: (32, 32)
-    tensor  = tensor[np.newaxis, np.newaxis, :, :]         # shape: (1, 1, 32, 32)
+    ready = _preprocess_for_tess(crop)
+    pil   = Image.fromarray(ready)
 
-    try:
-        pred   = _CNN_MODEL.predict({"tile": tensor})
-        logits = np.array(list(pred["logits"][0]))         # shape: (27,)
-        label  = _CNN_CLASSES[int(np.argmax(logits))]      # e.g. "A", "QU", "Z" …
-        return label.lower()                               # solver expects lowercase
-    except Exception as e:
-        print(f"  [CNN] tile {idx} inference error: {e}")
-        return "?"
+    letter, conf = _ocr_with_confidence(pil)
+
+    # ── Low-confidence fallback: try adaptive threshold variant ──
+    if conf < 60 or letter == "?":
+        adaptive = cv2.adaptiveThreshold(
+            crop, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 10
+        )
+        large2 = cv2.resize(adaptive, (192, 192), interpolation=cv2.INTER_CUBIC)
+        if np.mean(large2) < 127:
+            large2 = cv2.bitwise_not(large2)
+        bordered2 = cv2.copyMakeBorder(large2, 40, 40, 40, 40, cv2.BORDER_CONSTANT, value=255)
+        pil2 = Image.fromarray(bordered2)
+        letter2, conf2 = _ocr_with_confidence(pil2)
+        if conf2 > conf and letter2 != "?":
+            letter, conf = letter2, conf2
+
+    return letter.lower() if letter and letter != "?" else "?"
 
 def ocr_board(img: Image.Image) -> list:
     global DYNAMIC_TILE_COORDS
@@ -209,7 +280,7 @@ def ocr_board(img: Image.Image) -> list:
         letters.append(_read_tile(img_grey, box, i))
 
     rows = [" ".join(f"{letters[r*4+c].upper():>2}" for c in range(4)) for r in range(4)]
-    print(f"  OCR[CNN]:   {rows[0]}")
+    print(f"  OCR[Tess]:  {rows[0]}")
     for row in rows[1:]:
         print(f"              {row}")
     return letters
