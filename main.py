@@ -93,10 +93,16 @@ import cv2
 import pytesseract
 from concurrent.futures import ThreadPoolExecutor
 
-# Single-character mode, only allow A-Z
-_TESS_CONFIG = "--psm 10 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
 SIDE = TILE_CROP_PX * 2
+
+# Multiple configs tried per tile — highest confidence wins.
+# oem 1 = LSTM only (more accurate than legacy+LSTM for similar chars like C/G).
+_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_TESS_CONFIGS = [
+    f"--oem 1 --psm 10 -c tessedit_char_whitelist={_WHITELIST}",  # single char, LSTM
+    f"--oem 1 --psm 8  -c tessedit_char_whitelist={_WHITELIST}",  # single word, LSTM
+    f"--oem 1 --psm 13 -c tessedit_char_whitelist={_WHITELIST}",  # raw line, LSTM
+]
 
 
 def load_templates(folder: str = None) -> None:
@@ -117,36 +123,59 @@ def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
 
 def _preprocess_tile(crop: np.ndarray) -> np.ndarray:
     """
-    Prepare a tile crop for Tesseract:
-    1. Resize to a larger square (better accuracy on small crops)
-    2. CLAHE — normalise contrast regardless of tile colour (beige/green/grey)
-    3. Otsu threshold — crisp black letter on white background
-    4. Add a white border — Tesseract struggles right at the edge
+    Upsample 3× + CLAHE + Otsu threshold + white border.
+    CLAHE handles beige/green/grey tile backgrounds uniformly.
+    Otsu gives a clean black letter on white regardless of brightness.
     """
-    resized = cv2.resize(crop, (SIDE * 3, SIDE * 3), interpolation=cv2.INTER_CUBIC)
-    clahe   = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
-    eq      = clahe.apply(resized)
-    _, bw   = cv2.threshold(eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    # Ensure letter is dark-on-light (invert if needed)
-    if np.mean(bw) < 127:
+    resized  = cv2.resize(crop, (SIDE * 3, SIDE * 3), interpolation=cv2.INTER_CUBIC)
+    clahe    = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+    eq       = clahe.apply(resized)
+    _, bw    = cv2.threshold(eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(bw) < 127:          # ensure dark-on-light
         bw = cv2.bitwise_not(bw)
-    bordered = cv2.copyMakeBorder(bw, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
-    return bordered
+    return cv2.copyMakeBorder(bw, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+
+
+def _parse_tess_result(text: str) -> str:
+    """Normalise Tesseract output to a single letter or 'qu'."""
+    t = text.strip().upper()
+    if t in ("Q", "QU"):
+        return "qu"
+    if len(t) == 1 and t.isalpha():
+        return t.lower()
+    return ""
 
 
 def _read_tile(img_grey: np.ndarray, idx: int) -> str:
-    """OCR a single tile. Returns lowercase letter or '?'."""
+    """
+    OCR one tile using multiple Tesseract configs.
+    Each config returns a (letter, confidence) pair via image_to_data;
+    the result with the highest confidence is used.
+    Falls back to '?' only if every config fails.
+    """
     crop = _crop_tile(img_grey, idx)
     if crop.size == 0:
         return "?"
+
     processed = _preprocess_tile(crop)
-    text = pytesseract.image_to_string(processed, config=_TESS_CONFIG).strip().upper()
-    # Handle QU tile: Tesseract may read it as Q, QU, or two chars
-    if text in ("Q", "QU"):
-        return "qu"
-    if len(text) == 1 and text.isalpha():
-        return text.lower()
-    return "?"
+    best_letter = ""
+    best_conf   = -1.0
+
+    for cfg in _TESS_CONFIGS:
+        try:
+            data = pytesseract.image_to_data(
+                processed, config=cfg,
+                output_type=pytesseract.Output.DICT
+            )
+            for text, conf in zip(data["text"], data["conf"]):
+                letter = _parse_tess_result(text)
+                if letter and float(conf) > best_conf:
+                    best_conf   = float(conf)
+                    best_letter = letter
+        except Exception:
+            continue
+
+    return best_letter if best_letter else "?"
 
 
 def ocr_board(img: Image.Image) -> list:
