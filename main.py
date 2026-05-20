@@ -139,7 +139,7 @@ def find_dynamic_grid(img_grey: np.ndarray):
 # ─────────────────────────────────────────
 TEMPLATES_DIR = "templates"
 TEMPLATES = {}
-_TMPL_MATCH_THRESHOLD = 0.82
+_TMPL_MATCH_THRESHOLD = 0.75  # Lowered slightly to account for the sliding window
 
 # Pre-load and process templates at startup
 print("  [Init] Loading templates...")
@@ -148,23 +148,20 @@ for letter in "abcdefghijklmnopqrstuvwxyz":
     if os.path.exists(path):
         tmpl = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         if tmpl is not None:
-            # Convert template to edges for robust matching
-            tmpl_edges = cv2.Canny(tmpl, 50, 150) 
-            TEMPLATES[letter] = tmpl_edges
+            # Convert template to pure black and white (removes shadows/gradients)
+            _, tmpl_bw = cv2.threshold(tmpl, 127, 255, cv2.THRESH_BINARY)
+            TEMPLATES[letter] = tmpl_bw
     else:
         print(f"  [Warning] Missing template: {path}")
 
 def _read_tile(img_grey: np.ndarray, box: tuple, idx: int) -> str:
     x, y, w, h = box
     
-    # Crop exactly to the contour box
+    # 1. Grab the live crop and threshold it to pure black and white
     crop = img_grey[y:y+h, x:x+w]
-    
     if crop.size == 0:
         return "?"
-
-    # Convert live crop to edges
-    crop_edges = cv2.Canny(crop, 50, 150)
+    _, crop_bw = cv2.threshold(crop, 127, 255, cv2.THRESH_BINARY)
     
     best_letter = "?"
     best_score = 0.0
@@ -173,10 +170,15 @@ def _read_tile(img_grey: np.ndarray, box: tuple, idx: int) -> str:
         if tmpl is None or tmpl.size == 0:
             continue
             
-        # Resize template to match this exact dynamic crop size
-        resized_tmpl = cv2.resize(tmpl, (w, h), interpolation=cv2.INTER_AREA)
+        # 2. Resize template to be slightly SMALLER than the live crop
+        # This lets cv2.matchTemplate "slide" the image to find the exact match
+        tmpl_w = max(1, w - 6)
+        tmpl_h = max(1, h - 6)
         
-        result = cv2.matchTemplate(crop_edges, resized_tmpl, cv2.TM_CCOEFF_NORMED)
+        # INTER_NEAREST preserves hard black/white edges during resize
+        resized_tmpl = cv2.resize(tmpl, (tmpl_w, tmpl_h), interpolation=cv2.INTER_NEAREST)
+        
+        result = cv2.matchTemplate(crop_bw, resized_tmpl, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, _ = cv2.minMaxLoc(result)
 
         if max_val > best_score:
