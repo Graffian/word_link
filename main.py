@@ -579,4 +579,18 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description="Boggle Bot — template matching edition")
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help=(
+            "Capture a screenshot, save all 16 tile crops to ./templates/, then exit. "
+            "Rename each file to its letter (A.png ... Z.png, QU.png) before running normally."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.calibrate:
+        calibrate()
+    else:
+        run()# ── patched main ──────────────────────────────────────────────────────────────
