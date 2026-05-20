@@ -113,26 +113,43 @@ def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
     return img_grey[y1:y2, x1:x2]
 
 
+def _run_ocr(rgb: np.ndarray) -> list[str]:
+    """Call PaddleOCR predict and return rec_texts, or [] on failure."""
+    try:
+        result = _ocr.predict(rgb)
+    except Exception:
+        return []
+    if not result:
+        return []
+    texts = []
+    for res in result:
+        texts.extend(res["rec_texts"])
+    return texts
+
+
 def _ocr_tile(img_grey: np.ndarray, idx: int) -> str:
-    """Run PaddleOCR on one tile crop. Returns lowercase letter/qu or '?'."""
+    """Run PaddleOCR on one tile crop. Returns lowercase letter/qu or '?'.
+    Retries with a 2× upscaled crop when the first pass returns nothing —
+    thin letters like I are often missed at native resolution.
+    """
     if _ocr is None:
         raise RuntimeError("Call load_paddle_ocr() first.")
     crop = _crop_tile(img_grey, idx)
     if crop.size == 0:
         return "?"
-    # PaddleOCR v3.x expects an RGB numpy array via predict()
-    rgb = np.array(Image.fromarray(crop).convert("RGB"))
-    try:
-        result = _ocr.predict(rgb)
-    except Exception as exc:
-        print(f"  [OCR] tile {idx} error: {exc}")
-        return "?"
-    if not result:
-        return "?"
-    # v3.x result: list of dicts with key 'rec_texts' -> List[str]
-    texts = []
-    for res in result:
-        texts.extend(res["rec_texts"])
+
+    pil_crop = Image.fromarray(crop)
+    rgb = np.array(pil_crop.convert("RGB"))
+    texts = _run_ocr(rgb)
+
+    # Retry at 2× scale — catches thin letters (I, L, 1) the detector misses
+    if not texts:
+        w, h = pil_crop.size
+        rgb2x = np.array(pil_crop.resize((w * 2, h * 2), Image.LANCZOS).convert("RGB"))
+        texts = _run_ocr(rgb2x)
+        if texts:
+            print(f"  [OCR] tile {idx}: detected on 2× retry")
+
     if not texts:
         return "?"
     text = "".join(c for c in texts[0].strip().upper() if c.isalpha())
