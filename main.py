@@ -53,8 +53,13 @@ _TESS_CONFIG          = "--psm 10 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJK
 _TESS_CONFIG_FALLBACK = "--psm 10 --oem 3"   # no whitelist → lets digits/symbols through for "I" recovery
 # psm 10 = single character mode; whitelist prevents digit/symbol confusion
 
-# Characters Tesseract commonly returns instead of "I" (thin vertical stroke)
-_I_LOOKALIKES = {"1", "l", "|", "!", "/", "\\", "i"}
+# Characters Tesseract commonly returns instead of real letters.
+# Keyed by what Tesseract returns → what the actual Boggle letter is.
+_FALLBACK_CHAR_MAP = {
+    "0": "o",                                           # O → misread as zero
+    "1": "i", "l": "i", "|": "i", "!": "i",            # I → thin stroke lookalikes
+    "/": "i", "\\": "i",
+}
 
 # ── 4×4 board tile coordinates (WDA logical px) ──
 TILE_COORDS = {
@@ -149,8 +154,8 @@ def _read_tile(img_grey: np.ndarray, idx: int) -> str:
     # "|", "l", etc. or nothing at all.  Run a second pass without the letter
     # whitelist so those lookalike characters can come through, then remap them.
     raw_fb = pytesseract.image_to_string(pil, config=_TESS_CONFIG_FALLBACK).strip()
-    if len(raw_fb) == 1 and raw_fb in _I_LOOKALIKES:
-        return "i"
+    if len(raw_fb) == 1 and raw_fb in _FALLBACK_CHAR_MAP:
+        return _FALLBACK_CHAR_MAP[raw_fb]
     # ─────────────────────────────────────────────────────────────────────────
 
     print(f"  [OCR] No read at tile {idx:02d} (raw: {repr(raw)})")
