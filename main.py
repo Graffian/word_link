@@ -1,21 +1,19 @@
 """
-Boggle Bot — Template Matching tile OCR + curated dictionary + swipe input
+Boggle Bot — Tesseract OCR + curated dictionary + swipe input
 ──────────────────────────────────────────────────────────────────────────
 Pipeline:
   1. Screenshot via WebDriverAgent
-  2. Crop each board tile → OpenCV template matching → letter (A-Z or QU)
+  2. Crop each board tile → Tesseract OCR → letter (A-Z or QU)
   3. DFS solver over the curated dictionary
   4. Swipe the best word's tile path on the board
   5. Repeat on new board
 
 Requirements:
-  pip install opencv-python pillow numpy requests
+  pip install pillow numpy requests opencv-python pytesseract
+  brew install tesseract   # macOS
 
-First run:
-  python main.py --calibrate
-  → Saves 16 tile crops to ./templates/tile_00.png … tile_15.png
-  → Rename each file to its letter: A.png, B.png, … QU.png
-  → Run normally after that: python main.py
+No calibration needed — just run:
+  python main.py
 """
 
 import argparse
@@ -89,124 +87,82 @@ def tile_score(word: str) -> int:
 
 
 # ─────────────────────────────────────────
-#  TEMPLATE MATCHING TILE CLASSIFIER
+#  TESSERACT OCR  (local, ~50 ms for all 16 tiles)
 # ─────────────────────────────────────────
-import cv2  # imported once at module level — no per-call overhead
+import cv2
+import pytesseract
+from concurrent.futures import ThreadPoolExecutor
 
-SIDE = TILE_CROP_PX * 2   # pixel size of every template / crop
+# Single-character mode, only allow A-Z
+_TESS_CONFIG = "--psm 10 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
-# label → (normalised_grey, normalised_edges)  both float32, side×side
-_templates: dict = {}
-
-
-# ── Preprocessing helpers ─────────────────────────────────────────────────────
-
-def _preprocess(grey: np.ndarray):
-    """
-    Return (normalised_grey, edge_map) for a greyscale tile crop.
-    • CLAHE   – equalises contrast so brightness/shadow don't matter.
-    • Canny   – structural edges are brightness-invariant; matching on both
-                channels makes the classifier far more robust than pixels alone.
-    Both outputs are float32 in [0, 255].
-    """
-    clahe      = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-    normalised = clahe.apply(grey)
-    blurred    = cv2.GaussianBlur(normalised, (3, 3), 0)
-    edges      = cv2.Canny(blurred, 40, 120)
-    return normalised.astype(np.float32), edges.astype(np.float32)
+SIDE = TILE_CROP_PX * 2
 
 
-def load_templates(folder: str = TEMPLATES_DIR) -> None:
-    """
-    Load all letter templates from `folder`.
-    Each file must be named after its letter: A.png … Z.png, QU.png.
-    Templates are preprocessed (CLAHE + Canny) once at load time so
-    per-tile matching is purely fast numpy / OpenCV operations.
-    """
-    global _templates
-    if not os.path.isdir(folder):
-        raise FileNotFoundError(
-            f"Templates folder '{folder}' not found.\n"
-            f"Run once with --calibrate to generate it, then rename the files."
-        )
-    loaded = {}
-    for fname in sorted(os.listdir(folder)):
-        name, ext = os.path.splitext(fname)
-        if ext.lower() not in (".png", ".jpg", ".jpeg"):
-            continue
-        label = name.upper()
-        path  = os.path.join(folder, fname)
-        img   = Image.open(path).convert("L").resize((SIDE, SIDE), Image.LANCZOS)
-        grey  = np.array(img, dtype=np.uint8)
-        loaded[label] = _preprocess(grey)
-
-    if not loaded:
-        raise RuntimeError(f"No template images found in '{folder}'.")
-    _templates = loaded
-    print(f"  [OCR] Loaded {len(_templates)} templates: {sorted(_templates)}")
+def load_templates(folder: str = None) -> None:
+    """No-op — Tesseract needs no pre-loaded templates."""
+    print("  [OCR] Tesseract mode — no templates required.")
 
 
 def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
     cx = int(TILE_COORDS[idx][0] * COORD_SCALE)
     cy = int(TILE_COORDS[idx][1] * COORD_SCALE)
     h, w = img_grey.shape[:2]
-    x1, y1 = max(0, cx - TILE_CROP_PX), max(0, cy - TILE_CROP_PX)
-    x2, y2 = min(w, cx + TILE_CROP_PX), min(h, cy + TILE_CROP_PX)
+    x1 = max(0, cx - TILE_CROP_PX)
+    y1 = max(0, cy - TILE_CROP_PX)
+    x2 = min(w, cx + TILE_CROP_PX)
+    y2 = min(h, cy + TILE_CROP_PX)
     return img_grey[y1:y2, x1:x2]
 
 
-def _match_tile(img_grey: np.ndarray, idx: int) -> str:
+def _preprocess_tile(crop: np.ndarray) -> np.ndarray:
     """
-    Match one tile crop against all loaded templates.
-
-    Score = 0.6 × NCC(pixel channel) + 0.4 × NCC(edge channel).
-    Combining structural edges with normalised pixels gives near-100 %
-    accuracy across different lighting, tile colours and slight crop offsets.
-
-    Returns best-matching letter (lowercase) or '?' if confidence is low.
+    Prepare a tile crop for Tesseract:
+    1. Resize to a larger square (better accuracy on small crops)
+    2. CLAHE — normalise contrast regardless of tile colour (beige/green/grey)
+    3. Otsu threshold — crisp black letter on white background
+    4. Add a white border — Tesseract struggles right at the edge
     """
-    crop_raw = _crop_tile(img_grey, idx)
-    if crop_raw.size == 0:
+    resized = cv2.resize(crop, (SIDE * 3, SIDE * 3), interpolation=cv2.INTER_CUBIC)
+    clahe   = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+    eq      = clahe.apply(resized)
+    _, bw   = cv2.threshold(eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Ensure letter is dark-on-light (invert if needed)
+    if np.mean(bw) < 127:
+        bw = cv2.bitwise_not(bw)
+    bordered = cv2.copyMakeBorder(bw, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+    return bordered
+
+
+def _read_tile(img_grey: np.ndarray, idx: int) -> str:
+    """OCR a single tile. Returns lowercase letter or '?'."""
+    crop = _crop_tile(img_grey, idx)
+    if crop.size == 0:
         return "?"
-
-    crop_sq = cv2.resize(crop_raw, (SIDE, SIDE))
-    crop_px, crop_edges = _preprocess(crop_sq)
-
-    best_label = "?"
-    best_score = -1.0
-
-    for label, (tmpl_px, tmpl_edges) in _templates.items():
-        score_px    = float(cv2.matchTemplate(crop_px,    tmpl_px,    cv2.TM_CCOEFF_NORMED)[0, 0])
-        score_edges = float(cv2.matchTemplate(crop_edges, tmpl_edges, cv2.TM_CCOEFF_NORMED)[0, 0])
-        score = 0.6 * score_px + 0.4 * score_edges
-        if score > best_score:
-            best_score = score
-            best_label = label
-
-    if best_score < MATCH_THRESHOLD:
-        print(f"  [OCR] tile {idx}: low confidence ({best_score:.2f}) → ?")
-        return "?"
-
-    return best_label.lower()
+    processed = _preprocess_tile(crop)
+    text = pytesseract.image_to_string(processed, config=_TESS_CONFIG).strip().upper()
+    # Handle QU tile: Tesseract may read it as Q, QU, or two chars
+    if text in ("Q", "QU"):
+        return "qu"
+    if len(text) == 1 and text.isalpha():
+        return text.lower()
+    return "?"
 
 
 def ocr_board(img: Image.Image) -> list:
     """
-    OCR all 16 tiles via template matching.
-    Tiles are matched in parallel (8 workers) so total latency ≈ one tile.
-    Returns list of lowercase letter strings ('a'..'z', 'qu') or '?'.
+    OCR all 16 tiles via Tesseract in parallel.
+    Total latency ~50 ms. Returns lowercase letters or '?'.
     """
-    from concurrent.futures import ThreadPoolExecutor
-
     img_grey = np.array(img.convert("L"))
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        letters = list(pool.map(lambda i: _match_tile(img_grey, i), range(16)))
+        letters = list(pool.map(lambda i: _read_tile(img_grey, i), range(16)))
 
     rows = [" ".join(f"{letters[r*4+c].upper():>2}" for c in range(4)) for r in range(4)]
-    print(f"  OCR[tmpl]: {rows[0]}")
+    print(f"  OCR[tess]:  {rows[0]}")
     for row in rows[1:]:
-        print(f"             {row}")
+        print(f"              {row}")
 
     return letters
 
@@ -579,7 +535,7 @@ def run():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Boggle Bot — template matching edition")
+    parser = argparse.ArgumentParser(description="Boggle Bot — Tesseract OCR edition")
     parser.add_argument(
         "--calibrate",
         action="store_true",
