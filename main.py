@@ -41,7 +41,7 @@ MAX_WORD_LEN = 7
 
 # ── Crop ──
 COORD_SCALE = 3.0     # physical px = WDA logical px × scale (3.0 for Retina)
-TILE_CROP_PX = 120     # half-side of square crop around each tile centre
+TILE_CROP_PX = 60     # half-side of square crop around each tile centre
 
 # ── 4×4 board tile coordinates (WDA logical px) ──
 TILE_COORDS = {
@@ -127,10 +127,47 @@ def _run_ocr(rgb: np.ndarray) -> list[str]:
     return texts
 
 
+def _normalize_ocr_text(raw: str) -> str:
+    """
+    Normalize a raw OCR string to a single Boggle letter.
+    Handles common OCR confusions for this tile style:
+      0 → O  (circular tile background makes O look like zero)
+      1 → I  (thin stroke)
+    Returns lowercase letter/qu, or '' if nothing usable.
+    """
+    OCR_FIXES = {"0": "O", "1": "I", "8": "B", "5": "S", "6": "G"}
+    text = raw.strip().upper()
+    # Apply digit→letter fixes before stripping non-alpha
+    text = "".join(OCR_FIXES.get(c, c) for c in text)
+    text = "".join(c for c in text if c.isalpha())
+    if not text:
+        return ""
+    if text in ("QU", "Q"):
+        return "qu"
+    return text[0].lower()
+
+
+def _prepare_crops(pil_crop: Image.Image) -> list[np.ndarray]:
+    """
+    Return a list of RGB numpy arrays to try in order:
+      1. Contrast-boosted native size  (helps O on circular background)
+      2. Contrast-boosted 2× upscale   (helps thin letters like I)
+    """
+    from PIL import ImageEnhance
+    enhanced = ImageEnhance.Contrast(pil_crop).enhance(2.5)
+    w, h = enhanced.size
+    large  = enhanced.resize((w * 2, h * 2), Image.LANCZOS)
+    return [
+        np.array(enhanced.convert("RGB")),
+        np.array(large.convert("RGB")),
+    ]
+
+
 def _ocr_tile(img_grey: np.ndarray, idx: int) -> str:
-    """Run PaddleOCR on one tile crop. Returns lowercase letter/qu or '?'.
-    Retries with a 2× upscaled crop when the first pass returns nothing —
-    thin letters like I are often missed at native resolution.
+    """
+    Run PaddleOCR on one tile crop. Returns lowercase letter/qu or '?'.
+    - Contrast is boosted first to separate O from the circular tile background.
+    - Falls back to 2× upscale for thin letters (I, L).
     """
     if _ocr is None:
         raise RuntimeError("Call load_paddle_ocr() first.")
@@ -139,26 +176,16 @@ def _ocr_tile(img_grey: np.ndarray, idx: int) -> str:
         return "?"
 
     pil_crop = Image.fromarray(crop)
-    rgb = np.array(pil_crop.convert("RGB"))
-    texts = _run_ocr(rgb)
-
-    # Retry at 2× scale — catches thin letters (I, L, 1) the detector misses
-    if not texts:
-        w, h = pil_crop.size
-        rgb2x = np.array(pil_crop.resize((w * 2, h * 2), Image.LANCZOS).convert("RGB"))
-        texts = _run_ocr(rgb2x)
+    for attempt, rgb in enumerate(_prepare_crops(pil_crop)):
+        texts = _run_ocr(rgb)
         if texts:
-            print(f"  [OCR] tile {idx}: detected on 2× retry")
+            result = _normalize_ocr_text(texts[0])
+            if result:
+                if attempt > 0:
+                    print(f"  [OCR] tile {idx}: detected on attempt {attempt + 1}")
+                return result
 
-    if not texts:
-        return "?"
-    text = "".join(c for c in texts[0].strip().upper() if c.isalpha())
-    if not text:
-        return "?"
-    # QU is a single Boggle tile - treat Q alone as QU too
-    if text in ("QU", "Q"):
-        return "qu"
-    return text[0].lower()  # single letter; discard OCR noise beyond first char
+    return "?"
 
 
 def ocr_board(img: Image.Image) -> list[str]:
