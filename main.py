@@ -25,12 +25,12 @@ from io import BytesIO
 #  CONFIGURATION
 # ─────────────────────────────────────────
 WDA_URL      = "http://localhost:8100"
-MODEL_PATH   = "WordLinkTileCNN.mlmodelc"   # compiled Core ML bundle (directory)
+MODEL_PATH   = "WordLinkTileCNN_rebuilt.mlmodel"  # rebuilt from weights via Colab notebook
 CLASSES_PATH = "WordLinkTileClasses.json"   # class index → label, e.g. {0:"A",...,26:"QU"}
 DICT_PATH    = "Dictionary-curated.txt"
 
 # ── Timing ──
-BOARD_WAIT_OCR = 0.50   # wait after swipe before next screenshot (tile animation)
+BOARD_WAIT_OCR = 0.55   # wait after swipe before next screenshot (tile animation)
 HOLD_MS        = 50     # initial press on first tile
 TILE_PAUSE_MS  = 15     # slide duration between tiles (>0 = interpolated, not teleport)
 LIFT_DELAY_MS  = 120    # hold on last tile before lifting
@@ -132,7 +132,7 @@ def load_cnn(path: str = MODEL_PATH,
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"CNN model not found at '{path}'.\n"
-            "Expected a compiled .mlmodelc directory."
+            "Expected .mlpackage (from Colab notebook) or .mlmodelc directory."
         )
     _model = ct.models.MLModel(path)
     spec   = _model.get_spec()
@@ -162,7 +162,7 @@ def _classify_tile(img_grey: np.ndarray, idx: int) -> tuple[str, float]:
     crop = _crop_tile(img_grey, idx)
     if crop.size == 0:
         return "?", 0.0
-    pil    = Image.fromarray(crop).resize((CNN_INPUT_SIZE, CNN_INPUT_SIZE), Image.LANCZOS)
+    pil    = Image.fromarray(crop).resize((CNN_INPUT_SIZE, CNN_INPUT_SIZE), Image.BILINEAR)
     arr    = np.array(pil, dtype=np.float32) / 255.0
     arr    = arr.reshape(1, 1, CNN_INPUT_SIZE, CNN_INPUT_SIZE)
     try:
@@ -356,7 +356,7 @@ def swipe_path(indices):
     payload = {"actions": [{"type": "pointer", "id": "finger1",
                              "parameters": {"pointerType": "touch"}, "actions": acts}]}
     try:
-        r = _http.post(f"{WDA_URL}/session/{sid}/actions", json=payload, timeout=20)
+        r = _http.post(f"{WDA_URL}/session/{sid}/actions", json=payload, timeout=5)
         return r.status_code == 200
     except Exception as e:
         print(f"    [swipe] exception: {e}")
@@ -366,6 +366,15 @@ def swipe_path(indices):
 # ─────────────────────────────────────────
 #  MAIN LOOP
 # ─────────────────────────────────────────
+def _tier(w: str) -> int:
+    """Word length priority: 7 > 6 > 5. Anything else = 0 (never played)."""
+    n = len(w)
+    if n == 7: return 3
+    if n == 6: return 2
+    if n == 5: return 1
+    return 0
+
+
 def run():
     load_cnn(MODEL_PATH)
     words, prefixes = load_dictionary(DICT_PATH)
@@ -381,7 +390,8 @@ def run():
         get_session()
     except Exception as e:
         print(f"  [WDA] Could not connect: {e}")
-        print("  Make sure WebDriverAgent is running on port 8100.\n")
+        print("  Make sure WebDriverAgent is running on port 8100.")
+        return   # no point continuing without WDA
 
     played:            set[str] = set()
     last_letters:      list     = []
@@ -489,33 +499,22 @@ def run():
                 print(f"  Top: {top_str}")
                 in_game = True
 
-            # ── Pick best unplayed word ───────────────────────────────────────
-            # Priority: 7 → 6 → 5, never outside that range.
-            def _tier(w):
-                n = len(w)
-                if n == 7: return 3
-                if n == 6: return 2
-                if n == 5: return 1
-                return 0
-
-            candidates = [
+    
+            # Build sorted candidate list once per board; pop from front each swipe
+            unplayed = [
                 (w, p) for w, p in results.items()
                 if w not in played and MIN_WORD_LEN <= len(w) <= MAX_WORD_LEN
             ]
 
-            if not candidates:
+            if not unplayed:
                 print("  No 5-7 letter words on this board — waiting for next...")
                 in_game = False
                 time.sleep(2.0)
                 continue
 
-            remaining = sorted(
-                candidates,
-                key=lambda x: (_tier(x[0]), len(x[0])),
-                reverse=True
-            )
-
-            word, path = remaining[0]
+            # Sort once — best word is always first
+            unplayed.sort(key=lambda x: (_tier(x[0]), len(x[0])), reverse=True)
+            word, path = unplayed[0]
             played.add(word)
             score  = tile_score(word)
             est_ms = HOLD_MS + (len(path) - 1) * TILE_PAUSE_MS + LIFT_DELAY_MS
