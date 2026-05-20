@@ -121,19 +121,59 @@ def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
     return img_grey[y1:y2, x1:x2]
 
 
-def _preprocess_tile(crop: np.ndarray) -> np.ndarray:
-    """
-    Upsample 3× + CLAHE + Otsu threshold + white border.
-    CLAHE handles beige/green/grey tile backgrounds uniformly.
-    Otsu gives a clean black letter on white regardless of brightness.
-    """
-    resized  = cv2.resize(crop, (SIDE * 3, SIDE * 3), interpolation=cv2.INTER_CUBIC)
-    clahe    = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
-    eq       = clahe.apply(resized)
-    _, bw    = cv2.threshold(eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if np.mean(bw) < 127:          # ensure dark-on-light
-        bw = cv2.bitwise_not(bw)
+def _add_border(bw: np.ndarray) -> np.ndarray:
+    """Add white border so Tesseract doesn't clip edge letters."""
     return cv2.copyMakeBorder(bw, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+
+
+def _ensure_dark_on_light(bw: np.ndarray) -> np.ndarray:
+    return cv2.bitwise_not(bw) if np.mean(bw) < 127 else bw
+
+
+def _preprocess_variants(crop: np.ndarray) -> list:
+    """
+    Return several preprocessed versions of the same crop.
+    Tesseract is tried on each; whichever yields the highest confidence wins.
+    This prevents any single preprocessing failure (e.g. over-aggressive CLAHE
+    destroying thin strokes in E or L) from silently returning '?'.
+
+    Variants:
+      1. CLAHE + Otsu          — handles coloured tile backgrounds
+      2. Otsu only             — simpler; works when contrast is already good
+      3. Adaptive threshold    — robust when letter/background are similar tone
+      4. Fixed threshold @127  — last-resort fallback on very high-contrast crops
+    """
+    large = cv2.resize(crop, (SIDE * 3, SIDE * 3), interpolation=cv2.INTER_CUBIC)
+    results = []
+
+    # Variant 1: CLAHE + Otsu
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+    eq    = clahe.apply(large)
+    _, v1 = cv2.threshold(eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    results.append(_add_border(_ensure_dark_on_light(v1)))
+
+    # Variant 2: Otsu only (no CLAHE)
+    _, v2 = cv2.threshold(large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    results.append(_add_border(_ensure_dark_on_light(v2)))
+
+    # Variant 3: Adaptive threshold (handles uneven lighting across tile)
+    blurred = cv2.GaussianBlur(large, (3, 3), 0)
+    v3 = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 31, 10
+    )
+    results.append(_add_border(_ensure_dark_on_light(v3)))
+
+    # Variant 4: Fixed threshold @127 (clean screenshots are already high-contrast)
+    _, v4 = cv2.threshold(large, 127, 255, cv2.THRESH_BINARY)
+    results.append(_add_border(_ensure_dark_on_light(v4)))
+
+    return results
+
+
+def _preprocess_tile(crop: np.ndarray) -> np.ndarray:
+    """Return the primary preprocessed image (CLAHE+Otsu). Used by _disambiguate."""
+    return _preprocess_variants(crop)[0]
 
 
 def _parse_tess_result(text: str) -> str:
@@ -185,37 +225,41 @@ def _disambiguate(letter: str, bw: np.ndarray) -> str:
 def _read_tile(img_grey: np.ndarray, idx: int) -> str:
     """
     OCR one tile:
-    1. Try all Tesseract configs, pick highest-confidence result.
-    2. Run topology disambiguation to fix I/P and A/N confusions.
-    Falls back to '?' only if every config fails.
+    1. Try every combination of preprocessing variant × Tesseract config.
+    2. Pick the result with the highest confidence score.
+    3. Run topology disambiguation to fix I/P and A/N confusions.
+    Falls back to '?' only if every combination fails.
     """
     crop = _crop_tile(img_grey, idx)
     if crop.size == 0:
         return "?"
 
-    processed   = _preprocess_tile(crop)
+    variants    = _preprocess_variants(crop)
     best_letter = ""
     best_conf   = -1.0
+    best_img    = variants[0]   # used for disambiguation
 
-    for cfg in _TESS_CONFIGS:
-        try:
-            data = pytesseract.image_to_data(
-                processed, config=cfg,
-                output_type=pytesseract.Output.DICT
-            )
-            for text, conf in zip(data["text"], data["conf"]):
-                letter = _parse_tess_result(text)
-                if letter and float(conf) > best_conf:
-                    best_conf   = float(conf)
-                    best_letter = letter
-        except Exception:
-            continue
+    for img in variants:
+        for cfg in _TESS_CONFIGS:
+            try:
+                data = pytesseract.image_to_data(
+                    img, config=cfg,
+                    output_type=pytesseract.Output.DICT
+                )
+                for text, conf in zip(data["text"], data["conf"]):
+                    letter = _parse_tess_result(text)
+                    if letter and float(conf) > best_conf:
+                        best_conf   = float(conf)
+                        best_letter = letter
+                        best_img    = img
+            except Exception:
+                continue
 
     if not best_letter:
         return "?"
 
     # Fix I/P and A/N using hole counting — topology never lies
-    return _disambiguate(best_letter, processed)
+    return _disambiguate(best_letter, best_img)
 
 
 def ocr_board(img: Image.Image) -> list:
