@@ -1,16 +1,17 @@
 """
-Boggle Bot — Dynamic Contour & Template Matching Edition
+Boggle Bot — Dynamic Contour & Tesseract Edition
 ──────────────────────────────────────────────────────────────────────────
 Pipeline:
   1. Screenshot via WebDriverAgent
   2. OpenCV Contour Detection dynamically finds the 16 tiles (ignores UI shifts)
-  3. Crop each dynamic board tile → Edge-based Template Match → letter
+  3. Crop each dynamic board tile → Tesseract OCR (single-char mode) → letter
   4. DFS solver over the curated dictionary
   5. Swipe the best word's tile path on the board using dynamic WDA coordinates
   6. Repeat on new board
 
 Requirements:
-  pip install pillow numpy requests opencv-python
+  pip install pillow numpy requests opencv-python pytesseract
+  brew install tesseract   (or apt install tesseract-ocr)
 """
 
 import argparse
@@ -21,6 +22,7 @@ import os
 import threading
 import numpy as np
 import cv2
+import pytesseract
 from PIL import Image
 from io import BytesIO
 
@@ -43,6 +45,10 @@ MAX_WORD_LEN = 7
 
 # ── Crop & Scale ──
 COORD_SCALE  = 3.0    # physical px = WDA logical px × scale (3.0 for Retina)
+
+# ── Tesseract ──
+TEMPLATES_DIR = "templates"
+_TESS_CONFIG  = "--psm 10 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 # ── Dynamic Coordinates (Populated at Runtime) ──
 # Maps tile index (0-15) to its (x, y) logical WDA swipe coordinate
@@ -135,59 +141,45 @@ def find_dynamic_grid(img_grey: np.ndarray):
     return grid_boxes
 
 # ─────────────────────────────────────────
-#  TEMPLATE MATCHING ENGINE
+#  TESSERACT OCR ENGINE
 # ─────────────────────────────────────────
-TEMPLATES_DIR = "templates"
-TEMPLATES = {}
-_TMPL_MATCH_THRESHOLD = 0.75  # Lowered slightly to account for the sliding window
-
-# Pre-load and process templates at startup
-print("  [Init] Loading templates...")
-for letter in "abcdefghijklmnopqrstuvwxyz":
-    path = os.path.join(TEMPLATES_DIR, f"{letter.upper()}.png")
-    if os.path.exists(path):
-        tmpl = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        if tmpl is not None:
-            # Convert template to pure black and white (removes shadows/gradients)
-            _, tmpl_bw = cv2.threshold(tmpl, 127, 255, cv2.THRESH_BINARY)
-            TEMPLATES[letter] = tmpl_bw
-    else:
-        print(f"  [Warning] Missing template: {path}")
+def _preprocess_for_tess(crop: np.ndarray) -> np.ndarray:
+    _, bw_full = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bw_full, connectivity=8)
+    clean = np.zeros_like(bw_full)
+    tile_area = crop.shape[0] * crop.shape[1]
+    
+    # Filter out small noise (like point dots)
+    for lbl in range(1, n_labels):
+        if stats[lbl, cv2.CC_STAT_AREA] > tile_area * 0.01: 
+            clean[labels == lbl] = 255
+            
+    crop = cv2.bitwise_not(clean)
+    large = cv2.resize(crop, (128, 128), interpolation=cv2.INTER_CUBIC)
+    _, bw = cv2.threshold(large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(bw) < 127:                                       
+        bw = cv2.bitwise_not(bw)
+    return cv2.copyMakeBorder(bw, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=255)
 
 def _read_tile(img_grey: np.ndarray, box: tuple, idx: int) -> str:
     x, y, w, h = box
     
-    # 1. Grab the live crop and threshold it to pure black and white
-    crop = img_grey[y:y+h, x:x+w]
+    # Shrink the box by 10% to completely eliminate the outer tile border from the crop
+    margin_x = int(w * 0.1)
+    margin_y = int(h * 0.1)
+    crop = img_grey[y + margin_y : y + h - margin_y, x + margin_x : x + w - margin_x]
+    
     if crop.size == 0:
         return "?"
-    _, crop_bw = cv2.threshold(crop, 127, 255, cv2.THRESH_BINARY)
-    
-    best_letter = "?"
-    best_score = 0.0
 
-    for letter, tmpl in TEMPLATES.items():
-        if tmpl is None or tmpl.size == 0:
-            continue
-            
-        # 2. Resize template to be slightly SMALLER than the live crop
-        # This lets cv2.matchTemplate "slide" the image to find the exact match
-        tmpl_w = max(1, w - 6)
-        tmpl_h = max(1, h - 6)
-        
-        # INTER_NEAREST preserves hard black/white edges during resize
-        resized_tmpl = cv2.resize(tmpl, (tmpl_w, tmpl_h), interpolation=cv2.INTER_NEAREST)
-        
-        result = cv2.matchTemplate(crop_bw, resized_tmpl, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, _ = cv2.minMaxLoc(result)
+    ready = _preprocess_for_tess(crop)
+    pil   = Image.fromarray(ready)
+    raw   = pytesseract.image_to_string(pil, config=_TESS_CONFIG).strip().upper()
 
-        if max_val > best_score:
-            best_score = max_val
-            best_letter = letter
+    letter = next((c for c in raw if c.isalpha()), None)
+    if letter:
+        return letter.lower()
 
-    if best_score >= _TMPL_MATCH_THRESHOLD:
-        return best_letter
-        
     return "?"
 
 def ocr_board(img: Image.Image) -> list:
@@ -213,7 +205,7 @@ def ocr_board(img: Image.Image) -> list:
         letters.append(_read_tile(img_grey, box, i))
 
     rows = [" ".join(f"{letters[r*4+c].upper():>2}" for c in range(4)) for r in range(4)]
-    print(f"  OCR[Tmpl]:  {rows[0]}")
+    print(f"  OCR[Tess]:  {rows[0]}")
     for row in rows[1:]:
         print(f"              {row}")
     return letters
@@ -349,7 +341,7 @@ def run():
     words, prefixes = load_dictionary(DICT_PATH)
 
     print("\n" + "=" * 60)
-    print("   Boggle Bot  ⚡  Dynamic Contour + Template Matching Edition")
+    print("   Boggle Bot  ⚡  Dynamic Contour + Tesseract Edition")
     print("=" * 60)
     get_session()
 
