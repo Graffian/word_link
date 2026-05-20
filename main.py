@@ -1,17 +1,24 @@
 """
-Boggle Bot — PaddleOCR tile OCR + curated dictionary + swipe input
-───────────────────────────────────────────────────────────────────
+Boggle Bot — Template Matching tile OCR + curated dictionary + swipe input
+──────────────────────────────────────────────────────────────────────────
 Pipeline:
   1. Screenshot via WebDriverAgent
-  2. Crop each board tile → PaddleOCR → letter (A-Z or QU)
+  2. Crop each board tile → OpenCV template matching → letter (A-Z or QU)
   3. DFS solver over the curated dictionary
   4. Swipe the best word's tile path on the board
   5. Repeat on new board
 
 Requirements:
-  pip install paddleocr pillow numpy requests
+  pip install opencv-python pillow numpy requests
+
+First run:
+  python main.py --calibrate
+  → Saves 16 tile crops to ./templates/tile_00.png … tile_15.png
+  → Rename each file to its letter: A.png, B.png, … QU.png
+  → Run normally after that: python main.py
 """
 
+import argparse
 import requests
 import time
 import base64
@@ -40,8 +47,12 @@ MIN_WORD_LEN = 5   # only play 5-7 letter words (best score/risk ratio)
 MAX_WORD_LEN = 7
 
 # ── Crop ──
-COORD_SCALE = 3.0     # physical px = WDA logical px × scale (3.0 for Retina)
-TILE_CROP_PX = 60     # half-side of square crop around each tile centre
+COORD_SCALE  = 3.0    # physical px = WDA logical px × scale (3.0 for Retina)
+TILE_CROP_PX = 100    # half-side of square crop around each tile centre
+
+# ── Template matching ──
+TEMPLATES_DIR    = "templates"          # folder containing A.png … Z.png / QU.png
+MATCH_THRESHOLD  = 0.60                 # minimum normalised cross-correlation score
 
 # ── 4×4 board tile coordinates (WDA logical px) ──
 TILE_COORDS = {
@@ -78,30 +89,37 @@ def tile_score(word: str) -> int:
 
 
 # ─────────────────────────────────────────
-#  PADDLEOCR TILE CLASSIFIER
+#  TEMPLATE MATCHING TILE CLASSIFIER
 # ─────────────────────────────────────────
-_ocr = None
+_templates: dict[str, np.ndarray] = {}   # label → greyscale template array
 
 
-def load_paddle_ocr() -> None:
-    global _ocr
-    try:
-        from paddleocr import PaddleOCR
-    except ImportError:
-        import subprocess, sys
-        print("  Installing paddleocr…")
-        subprocess.check_call([sys.executable, "-m", "pip",
-                               "install", "paddleocr", "-q"])
-        from paddleocr import PaddleOCR
-    # v3.x API: use_textline_orientation replaces use_angle_cls.
-    # Tiles are always upright so all orientation/unwarping models are off.
-    _ocr = PaddleOCR(
-        lang="en",
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
-    )
-    print("  [OCR] PaddleOCR ready.")
+def load_templates(folder: str = TEMPLATES_DIR) -> None:
+    """
+    Load all letter templates from `folder`.
+    Each file must be named after its letter: A.png, B.png … Z.png, QU.png.
+    Templates are resized to TILE_CROP_PX*2 square to match live crops.
+    """
+    global _templates
+    if not os.path.isdir(folder):
+        raise FileNotFoundError(
+            f"Templates folder '{folder}' not found.\n"
+            f"Run once with --calibrate to generate it, then rename the files."
+        )
+    side = TILE_CROP_PX * 2
+    loaded = {}
+    for fname in os.listdir(folder):
+        name, ext = os.path.splitext(fname)
+        if ext.lower() not in (".png", ".jpg", ".jpeg"):
+            continue
+        label = name.upper()
+        path  = os.path.join(folder, fname)
+        img   = Image.open(path).convert("L").resize((side, side), Image.LANCZOS)
+        loaded[label] = np.array(img, dtype=np.float32)
+    if not loaded:
+        raise RuntimeError(f"No template images found in '{folder}'.")
+    _templates = loaded
+    print(f"  [OCR] Loaded {len(_templates)} templates: {sorted(_templates)}")
 
 
 def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
@@ -113,97 +131,77 @@ def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
     return img_grey[y1:y2, x1:x2]
 
 
-def _run_ocr(rgb: np.ndarray) -> list[str]:
-    """Call PaddleOCR predict and return rec_texts, or [] on failure."""
-    try:
-        result = _ocr.predict(rgb)
-    except Exception:
-        return []
-    if not result:
-        return []
-    texts = []
-    for res in result:
-        texts.extend(res["rec_texts"])
-    return texts
-
-
-def _normalize_ocr_text(raw: str) -> str:
+def _match_tile(img_grey: np.ndarray, idx: int) -> str:
     """
-    Normalize a raw OCR string to a single Boggle letter.
-    Handles common OCR confusions for this tile style:
-      0 → O  (circular tile background makes O look like zero)
-      1 → I  (thin stroke)
-    Returns lowercase letter/qu, or '' if nothing usable.
+    Match one tile crop against all loaded templates using normalised
+    cross-correlation. Returns the best-matching letter (lowercase) or '?'.
     """
-    OCR_FIXES = {"0": "O", "1": "I", "8": "B", "5": "S", "6": "G"}
-    text = raw.strip().upper()
-    # Apply digit→letter fixes before stripping non-alpha
-    text = "".join(OCR_FIXES.get(c, c) for c in text)
-    text = "".join(c for c in text if c.isalpha())
-    if not text:
-        return ""
-    if text in ("QU", "Q"):
-        return "qu"
-    return text[0].lower()
-
-
-def _prepare_crops(pil_crop: Image.Image) -> list[np.ndarray]:
-    """
-    Return a list of RGB numpy arrays to try in order:
-      1. Contrast-boosted native size  (helps O on circular background)
-      2. Contrast-boosted 2× upscale   (helps thin letters like I)
-    """
-    from PIL import ImageEnhance
-    enhanced = ImageEnhance.Contrast(pil_crop).enhance(2.5)
-    w, h = enhanced.size
-    large  = enhanced.resize((w * 2, h * 2), Image.LANCZOS)
-    return [
-        np.array(enhanced.convert("RGB")),
-        np.array(large.convert("RGB")),
-    ]
-
-
-def _ocr_tile(img_grey: np.ndarray, idx: int) -> str:
-    """
-    Run PaddleOCR on one tile crop. Returns lowercase letter/qu or '?'.
-    - Contrast is boosted first to separate O from the circular tile background.
-    - Falls back to 2× upscale for thin letters (I, L).
-    """
-    if _ocr is None:
-        raise RuntimeError("Call load_paddle_ocr() first.")
+    import cv2
     crop = _crop_tile(img_grey, idx)
     if crop.size == 0:
         return "?"
 
-    pil_crop = Image.fromarray(crop)
-    for attempt, rgb in enumerate(_prepare_crops(pil_crop)):
-        texts = _run_ocr(rgb)
-        if texts:
-            result = _normalize_ocr_text(texts[0])
-            if result:
-                if attempt > 0:
-                    print(f"  [OCR] tile {idx}: detected on attempt {attempt + 1}")
-                return result
+    side = TILE_CROP_PX * 2
+    crop_resized = cv2.resize(crop, (side, side)).astype(np.float32)
 
-    return "?"
+    best_label = "?"
+    best_score = -1.0
+    for label, tmpl in _templates.items():
+        res   = cv2.matchTemplate(crop_resized, tmpl, cv2.TM_CCOEFF_NORMED)
+        score = float(res[0, 0])
+        if score > best_score:
+            best_score = score
+            best_label = label
+
+    if best_score < MATCH_THRESHOLD:
+        print(f"  [OCR] tile {idx}: low confidence ({best_score:.2f}) → ?")
+        return "?"
+
+    return best_label.lower()   # e.g. "a", "qu"
 
 
 def ocr_board(img: Image.Image) -> list[str]:
     """
-    OCR all 16 tiles with PaddleOCR.
+    OCR all 16 tiles via template matching.
     Returns list of lowercase letter strings ('a'..'z', 'qu') or '?'.
     """
     img_grey = np.array(img.convert("L"))
-    letters  = [_ocr_tile(img_grey, i) for i in range(16)]
+    letters  = [_match_tile(img_grey, i) for i in range(16)]
 
-    # Pretty-print 4×4 grid
     rows = [" ".join(f"{letters[r*4+c].upper():>2}" for c in range(4)) for r in range(4)]
-    print(f"  OCR[Paddle]: {rows[0]}")
+    print(f"  OCR[tmpl]: {rows[0]}")
     for row in rows[1:]:
-        print(f"               {row}")
+        print(f"             {row}")
 
     return letters
 
+
+# ─────────────────────────────────────────
+#  CALIBRATION
+# ─────────────────────────────────────────
+def calibrate():
+    """
+    Capture a screenshot, save all 16 tile crops to ./templates/tile_00.png
+    … tile_15.png, then exit. Rename each file to its letter (A.png etc.)
+    before running normally.
+    """
+    os.makedirs(TEMPLATES_DIR, exist_ok=True)
+    print("  [calibrate] Connecting to WDA…")
+    get_session()
+    print("  [calibrate] Taking screenshot…")
+    img      = take_screenshot()
+    img_grey = np.array(img.convert("L"))
+    side     = TILE_CROP_PX * 2
+    import cv2
+    for i in range(16):
+        crop      = _crop_tile(img_grey, i)
+        crop_sq   = cv2.resize(crop, (side, side))
+        out_path  = os.path.join(TEMPLATES_DIR, f"tile_{i:02d}.png")
+        cv2.imwrite(out_path, crop_sq)
+    print(f"\n  Saved 16 crops to ./{TEMPLATES_DIR}/")
+    print("  ── Rename each file to its letter ──")
+    print("  e.g.:  mv templates/tile_00.png templates/A.png")
+    print("  Then run:  python main.py")
 
 
 # ─────────────────────────────────────────
