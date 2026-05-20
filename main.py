@@ -313,9 +313,7 @@ def ocr_board(img: Image.Image) -> list:
 # ─────────────────────────────────────────
 def calibrate():
     """
-    Capture a screenshot, save all 16 tile crops to ./templates/tile_00.png
-    … tile_15.png, then exit. Rename each file to its letter (A.png etc.)
-    before running normally.
+    Capture a screenshot, save all 16 PREPROCESSED tile crops to ./templates/
     """
     os.makedirs(TEMPLATES_DIR, exist_ok=True)
     print("  [calibrate] Connecting to WDA…")
@@ -323,17 +321,17 @@ def calibrate():
     print("  [calibrate] Taking screenshot…")
     img      = take_screenshot()
     img_grey = np.array(img.convert("L"))
-    side     = TILE_CROP_PX * 2
-    import cv2
+    
     for i in range(16):
-        crop      = _crop_tile(img_grey, i)
-        crop_sq   = cv2.resize(crop, (side, side))
+        crop = _crop_tile(img_grey, i)
+        if crop.size == 0:
+            continue
+        # Apply the exact same preprocessing used during live gameplay
+        canonical = _canonical_preprocess(crop)
         out_path  = os.path.join(TEMPLATES_DIR, f"tile_{i:02d}.png")
-        cv2.imwrite(out_path, crop_sq)
-    print(f"\n  Saved 16 crops to ./{TEMPLATES_DIR}/")
-    print("  ── Rename each file to its letter ──")
-    print("  e.g.:  mv templates/tile_00.png templates/A.png")
-    print("  Then run:  python main.py")
+        cv2.imwrite(out_path, canonical)
+        
+    print(f"\n  Saved 16 processed crops to ./{TEMPLATES_DIR}/")
 
 
 # ─────────────────────────────────────────
