@@ -1,15 +1,15 @@
 """
-Boggle Bot — CNN tile OCR + curated dictionary + swipe input
-─────────────────────────────────────────────────────────────
+Boggle Bot — PaddleOCR tile OCR + curated dictionary + swipe input
+───────────────────────────────────────────────────────────────────
 Pipeline:
   1. Screenshot via WebDriverAgent
-  2. Crop each board tile → resize 32×32 → CNN → letter (A-Z or QU)
+  2. Crop each board tile → PaddleOCR → letter (A-Z or QU)
   3. DFS solver over the curated dictionary
   4. Swipe the best word's tile path on the board
   5. Repeat on new board
 
 Requirements:
-  pip install coremltools pillow numpy requests
+  pip install paddleocr pillow numpy requests
 """
 
 import requests
@@ -24,10 +24,8 @@ from io import BytesIO
 # ─────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────
-WDA_URL      = "http://localhost:8100"
-MODEL_PATH   = "WordLinkTileCNN_rebuilt.mlmodel"  # rebuilt from weights via Colab notebook
-CLASSES_PATH = "WordLinkTileClasses.json"   # class index → label, e.g. {0:"A",...,26:"QU"}
-DICT_PATH    = "Dictionary-curated.txt"
+WDA_URL   = "http://localhost:8100"
+DICT_PATH = "Dictionary-curated.txt"
 
 # ── Timing ──
 BOARD_WAIT_OCR = 0.55   # wait after swipe before next screenshot (tile animation)
@@ -41,14 +39,9 @@ IDLE_TIMEOUT   = 4.5    # seconds with no successful swipe → assume round over
 MIN_WORD_LEN = 5   # only play 5-7 letter words (best score/risk ratio)
 MAX_WORD_LEN = 7
 
-# ── CNN ──
-CNN_INPUT_SIZE = 32      # model expects 32×32 grayscale
-CNN_CONFIDENCE = 0.55    # tiles below this threshold → "?"
-COORD_SCALE    = 3.0     # physical px = WDA logical px × scale (3.0 for Retina)
-TILE_CROP_PX   = 100      # half-side of square crop around each tile centre
-
-# CNN_CLASSES is loaded from CLASSES_PATH at startup — do not hardcode here.
-CNN_CLASSES: list[str] = []
+# ── Crop ──
+COORD_SCALE = 3.0     # physical px = WDA logical px × scale (3.0 for Retina)
+TILE_CROP_PX = 100     # half-side of square crop around each tile centre
 
 # ── 4×4 board tile coordinates (WDA logical px) ──
 TILE_COORDS = {
@@ -85,65 +78,24 @@ def tile_score(word: str) -> int:
 
 
 # ─────────────────────────────────────────
-#  CNN TILE CLASSIFIER
+#  PADDLEOCR TILE CLASSIFIER
 # ─────────────────────────────────────────
-_model = None
+_ocr = None
 
 
-def load_cnn(path: str = MODEL_PATH,
-             classes_path: str = CLASSES_PATH) -> None:
-    global _model, CNN_CLASSES
-    import json
-
-    # ── Load class labels from JSON ──────────────────────────────────────────
-    # JSON can be:  ["A","B",...,"QU"]          (list, index = class idx)
-    # or:           {"0":"A","1":"B",...}        (dict with string keys)
-    # or:           {"A":0,"B":1,...}            (label → index, inverted)
-    if not os.path.exists(classes_path):
-        raise FileNotFoundError(f"Classes JSON not found: '{classes_path}'")
-    with open(classes_path) as f:
-        raw = json.load(f)
-    # Format: {"classes": ["A","B",...,"QU",...], "image_size": 32, "channels": 1}
-    if isinstance(raw, dict) and "classes" in raw:
-        CNN_CLASSES = [str(c).upper() for c in raw["classes"]]
-    elif isinstance(raw, list):
-        CNN_CLASSES = [str(c).upper() for c in raw]
-    elif isinstance(raw, dict):
-        first_val = next(iter(raw.values()))
-        if isinstance(first_val, int):
-            CNN_CLASSES = [None] * len(raw)
-            for label, idx in raw.items():
-                CNN_CLASSES[idx] = str(label).upper()
-        else:
-            CNN_CLASSES = [str(raw[k]).upper() for k in sorted(raw, key=lambda k: int(k))]
-    print(f"  [CNN] Classes ({len(CNN_CLASSES)}): {CNN_CLASSES}")
-    print(f"  [CNN] QU is at index {CNN_CLASSES.index('QU')}")
-
-    # ── Load Core ML model ───────────────────────────────────────────────────
+def load_paddle_ocr() -> None:
+    global _ocr
     try:
-        import coremltools as ct  # type: ignore
+        from paddleocr import PaddleOCR
     except ImportError:
         import subprocess, sys
-        print("  Installing coremltools…")
+        print("  Installing paddleocr…")
         subprocess.check_call([sys.executable, "-m", "pip",
-                               "install", "coremltools", "-q"])
-        import coremltools as ct  # type: ignore
-
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"CNN model not found at '{path}'.\n"
-            "Expected .mlpackage (from Colab notebook) or .mlmodelc directory."
-        )
-    _model = ct.models.MLModel(path)
-    spec   = _model.get_spec()
-    ins    = [i.name for i in spec.description.input]
-    outs   = [o.name for o in spec.description.output]
-    print(f"  [CNN] Loaded '{path}'  inputs={ins}  outputs={outs}")
-
-
-def _softmax(x: np.ndarray) -> np.ndarray:
-    e = np.exp(x - x.max())
-    return e / e.sum()
+                               "install", "paddleocr", "-q"])
+        from paddleocr import PaddleOCR
+    # use_angle_cls=False: tiles are always upright, no need for rotation detection
+    _ocr = PaddleOCR(use_angle_cls=False, lang="en", show_log=False)
+    print("  [OCR] PaddleOCR ready.")
 
 
 def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
@@ -155,45 +107,51 @@ def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
     return img_grey[y1:y2, x1:x2]
 
 
-def _classify_tile(img_grey: np.ndarray, idx: int) -> tuple[str, float]:
-    """Run CNN on one tile. Returns (lowercase_letter_or_qu, confidence)."""
-    if _model is None:
-        raise RuntimeError("Call load_cnn() first.")
+def _ocr_tile(img_grey: np.ndarray, idx: int) -> str:
+    """Run PaddleOCR on one tile crop. Returns lowercase letter/qu or '?'."""
+    if _ocr is None:
+        raise RuntimeError("Call load_paddle_ocr() first.")
     crop = _crop_tile(img_grey, idx)
     if crop.size == 0:
-        return "?", 0.0
-    pil    = Image.fromarray(crop).resize((CNN_INPUT_SIZE, CNN_INPUT_SIZE), Image.BILINEAR)
-    arr    = np.array(pil, dtype=np.float32) / 255.0
-    arr    = arr.reshape(1, 1, CNN_INPUT_SIZE, CNN_INPUT_SIZE)
+        return "?"
+    # PaddleOCR expects an RGB numpy array
+    rgb = np.array(Image.fromarray(crop).convert("RGB"))
     try:
-        pred   = _model.predict({"tile": arr})       # input name from metadata.json
-        logits = np.array(pred["logits"], dtype=np.float32).flatten()  # output name from metadata.json
-        probs  = _softmax(logits)
-        i      = int(np.argmax(probs))
-        conf   = float(probs[i])
-        if i >= len(CNN_CLASSES) or conf < CNN_CONFIDENCE:
-            return "?", conf
-        return CNN_CLASSES[i].lower(), conf   # e.g. "a" or "qu"
+        result = _ocr.ocr(rgb, cls=False)
     except Exception as exc:
-        print(f"  [CNN] tile {idx} error: {exc}")
-        return "?", 0.0
+        print(f"  [OCR] tile {idx} error: {exc}")
+        return "?"
+    if not result or not result[0]:
+        return "?"
+    # Collect all text fragments detected in this crop
+    texts = [line[1][0].strip().upper() for line in result[0] if line[1][0].strip()]
+    if not texts:
+        return "?"
+    text = "".join(c for c in texts[0] if c.isalpha())
+    if not text:
+        return "?"
+    # QU is a single Boggle tile — treat Q alone as QU too
+    if text in ("QU", "Q"):
+        return "qu"
+    return text[0].lower()  # single letter; discard OCR noise beyond first char
 
 
 def ocr_board(img: Image.Image) -> list[str]:
     """
-    OCR all 16 tiles with the CNN.
+    OCR all 16 tiles with PaddleOCR.
     Returns list of lowercase letter strings ('a'..'z', 'qu') or '?'.
     """
     img_grey = np.array(img.convert("L"))
-    letters  = [_classify_tile(img_grey, i)[0] for i in range(16)]
+    letters  = [_ocr_tile(img_grey, i) for i in range(16)]
 
     # Pretty-print 4×4 grid
     rows = [" ".join(f"{letters[r*4+c].upper():>2}" for c in range(4)) for r in range(4)]
-    print(f"  OCR[CNN]: {rows[0]}")
+    print(f"  OCR[Paddle]: {rows[0]}")
     for row in rows[1:]:
-        print(f"            {row}")
+        print(f"               {row}")
 
     return letters
+
 
 
 # ─────────────────────────────────────────
@@ -376,13 +334,12 @@ def _tier(w: str) -> int:
 
 
 def run():
-    load_cnn(MODEL_PATH)
+    load_paddle_ocr()
     words, prefixes = load_dictionary(DICT_PATH)
 
     print("\n" + "=" * 54)
-    print("   Boggle Bot  ⚡  CNN Edition")
+    print("   Boggle Bot  ⚡  PaddleOCR Edition")
     print("=" * 54)
-    print(f"  Model : {MODEL_PATH}")
     print(f"  Dict  : {DICT_PATH}  ({len(words):,} words)")
     print("Ctrl+C to stop.\n")
 
