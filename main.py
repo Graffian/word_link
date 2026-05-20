@@ -41,7 +41,7 @@ MAX_WORD_LEN = 7
 
 # ── Crop ──
 COORD_SCALE = 3.0     # physical px = WDA logical px × scale (3.0 for Retina)
-TILE_CROP_PX = 100     # half-side of square crop around each tile centre
+TILE_CROP_PX = 60     # half-side of square crop around each tile centre
 
 # ── 4×4 board tile coordinates (WDA logical px) ──
 TILE_COORDS = {
@@ -93,8 +93,14 @@ def load_paddle_ocr() -> None:
         subprocess.check_call([sys.executable, "-m", "pip",
                                "install", "paddleocr", "-q"])
         from paddleocr import PaddleOCR
-    # use_angle_cls=False: tiles are always upright, no need for rotation detection
-    _ocr = PaddleOCR(use_angle_cls=False, lang="en", show_log=False)
+    # v3.x API: use_textline_orientation replaces use_angle_cls.
+    # Tiles are always upright so all orientation/unwarping models are off.
+    _ocr = PaddleOCR(
+        lang="en",
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+    )
     print("  [OCR] PaddleOCR ready.")
 
 
@@ -114,23 +120,25 @@ def _ocr_tile(img_grey: np.ndarray, idx: int) -> str:
     crop = _crop_tile(img_grey, idx)
     if crop.size == 0:
         return "?"
-    # PaddleOCR expects an RGB numpy array
+    # PaddleOCR v3.x expects an RGB numpy array via predict()
     rgb = np.array(Image.fromarray(crop).convert("RGB"))
     try:
-        result = _ocr.ocr(rgb, cls=False)
+        result = _ocr.predict(rgb)
     except Exception as exc:
         print(f"  [OCR] tile {idx} error: {exc}")
         return "?"
-    if not result or not result[0]:
+    if not result:
         return "?"
-    # Collect all text fragments detected in this crop
-    texts = [line[1][0].strip().upper() for line in result[0] if line[1][0].strip()]
+    # v3.x result: list of dicts with key 'rec_texts' -> List[str]
+    texts = []
+    for res in result:
+        texts.extend(res["rec_texts"])
     if not texts:
         return "?"
-    text = "".join(c for c in texts[0] if c.isalpha())
+    text = "".join(c for c in texts[0].strip().upper() if c.isalpha())
     if not text:
         return "?"
-    # QU is a single Boggle tile — treat Q alone as QU too
+    # QU is a single Boggle tile - treat Q alone as QU too
     if text in ("QU", "Q"):
         return "qu"
     return text[0].lower()  # single letter; discard OCR noise beyond first char
