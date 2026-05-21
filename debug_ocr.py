@@ -121,7 +121,6 @@ for i in range(16):
     cx = int(lx * COORD_SCALE)
     cy = int(ly * COORD_SCALE)
 
-    # 1. Calculate the tight bounding box
     box = (
         max(0, cx - phys_radius),
         max(0, cy - phys_radius),
@@ -129,14 +128,10 @@ for i in range(16):
         min(h_img, cy + phys_radius)
     )
     
-    # 2. Extract strictly the single tile face
     full = screenshot.crop(box)
-
-    # 3. Resize and convert to grayscale to match model dimensions
+    
+    # Keep it natural grayscale to match P.png
     full = full.resize((64, 64)).convert("L")
-
-    # 4. Stark black & white thresholding (strips away shading/anti-aliasing)
-    full = full.point(lambda p: 255 if p > 150 else 0)
 
     tiles_pil.append(full)
     batch.append(np.array(full, dtype=np.float32))

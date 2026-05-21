@@ -36,10 +36,10 @@ DIRTY_TILE_LIMIT = 10
 MIN_WORD_LEN = 3   # game requires 3+
 
 TILE_COORDS = {
-     0: (  84,  383),  1: ( 170,  388),  2: ( 256,  386),  3: ( 345,  383),
-     4: (  78,  473),  5: ( 171,  472),  6: ( 254,  467),  7: ( 357,  476),
-     8: (  81,  564),  9: ( 169,  562), 10: ( 262,  562), 11: ( 353,  554),
-    12: (  81,  652), 13: ( 173,  650), 14: ( 257,  646), 15: ( 358,  654),
+     0: (  86,  391),  1: ( 174,  391),  2: ( 263,  391),  3: ( 352,  391),
+     4: (  86,  480),  5: ( 174,  480),  6: ( 263,  480),  7: ( 352,  480),
+     8: (  86,  569),  9: ( 174,  569), 10: ( 263,  569), 11: ( 352,  569),
+    12: (  86,  658), 13: ( 174,  658), 14: ( 263,  658), 15: ( 352,  658),
 }
 
 COORD_SCALE  = 3.0
@@ -184,21 +184,13 @@ _scale_checked = False  # only validate once per run
 
 
 def _crop_tile(img: Image.Image, tile_idx: int) -> Image.Image:
-    """
-    Crop and preprocess one tile to the exact 64x64 grayscale format.
-    Uses a tight crop to avoid the 3D tile bevels and shadows entirely.
-    """
     cx = int(TILE_COORDS[tile_idx][0] * COORD_SCALE)
     cy = int(TILE_COORDS[tile_idx][1] * COORD_SCALE)
 
-    # 1. TIGHT CROP
-    # The distance between tile centers is ~90 logical points.
-    # A radius of 38 gives a 76x76 point box, which perfectly bounds 
-    # the letter and dots while safely avoiding the dark, rounded tile edges.
+    # 1. Use the tight crop that avoids tile borders
     logical_radius = 38
     phys_radius = int(logical_radius * COORD_SCALE)
     
-    # Calculate box safely within bounds
     box = (
         max(0, cx - phys_radius),
         max(0, cy - phys_radius),
@@ -207,14 +199,9 @@ def _crop_tile(img: Image.Image, tile_idx: int) -> Image.Image:
     )
     
     tile = img.crop(box)
-
-    # 2. Resize to the 64x64 format the model expects
+    
+    # 2. Resize and convert to grayscale naturally (NO harsh thresholding)
     tile = tile.resize((64, 64)).convert("L")
-
-    # 3. STARK THRESHOLDING
-    # The training data (e.g., A_6.png) is pure black and white. 
-    # We must strip out any grey anti-aliasing or subtle lighting.
-    tile = tile.point(lambda p: 255 if p > 150 else 0)
 
     return tile
 
