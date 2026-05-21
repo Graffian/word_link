@@ -45,6 +45,14 @@ TILE_COORDS = {
 COORD_SCALE  = 3.0
 TILE_CROP_PX = 320    # Radius of square crop around centre to get full 640x640 base tile
 
+# ── OCR Debug ──
+# Set to True once to dump every preprocessed tile to debug_tiles/ so you
+# can visually verify what the model is actually seeing.
+DEBUG_OCR         = False
+DEBUG_OCR_DIR     = "debug_tiles"
+# Predictions below this confidence are returned as "?" (likely off-board)
+CONFIDENCE_THRESH = 0.50
+
 # Exact alphabetical order matching tf.keras.preprocessing.image_dataset_from_directory
 CLASS_NAMES = [
     'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 
@@ -148,16 +156,46 @@ def take_screenshot(retries: int = 3) -> Image.Image:
 # ─────────────────────────────────────────
 #  HIGH-SPEED CNN INFERENCE OCR
 # ─────────────────────────────────────────
-def _get_model_prediction(img: Image.Image, tile_idx: int) -> str:
+
+def _validate_coord_scale(w_img: int, h_img: int) -> None:
+    """
+    Warn once if COORD_SCALE looks wrong for this screenshot.
+    WDA can return screenshots at 1x, 2x, or 3x depending on device + config.
+    A 3x iPhone 14 Pro is 1290×2796; 2x would be 828×1792; 1x ~390×844.
+    The rightmost tile centre (tile 3) in logical coords is x=345.  At the
+    current COORD_SCALE that maps to x={int(345*COORD_SCALE)}.
+    If that pixel is outside the screenshot width, COORD_SCALE is wrong.
+    """
+    max_logical_x = max(x for x, _ in TILE_COORDS.values())
+    max_logical_y = max(y for _, y in TILE_COORDS.values())
+    if int(max_logical_x * COORD_SCALE) >= w_img or int(max_logical_y * COORD_SCALE) >= h_img:
+        # Try to suggest the correct scale
+        for scale in (1.0, 2.0, 3.0):
+            if int(max_logical_x * scale) < w_img and int(max_logical_y * scale) < h_img:
+                print(f"  ⚠️  [OCR] COORD_SCALE={COORD_SCALE} maps tiles outside the "
+                      f"{w_img}×{h_img} screenshot! "
+                      f"Try setting COORD_SCALE = {scale}")
+                break
+        else:
+            print(f"  ⚠️  [OCR] COORD_SCALE={COORD_SCALE} looks wrong for {w_img}×{h_img} "
+                  f"screenshot. Check TILE_COORDS match the current device.")
+
+_scale_checked = False  # only validate once per run
+
+
+def _crop_tile(img: Image.Image, tile_idx: int) -> Image.Image:
+    """
+    Crop and preprocess one tile to the exact 64×64 grayscale format
+    the model was trained on.
+    """
     cx = int(TILE_COORDS[tile_idx][0] * COORD_SCALE)
     cy = int(TILE_COORDS[tile_idx][1] * COORD_SCALE)
     w_img, h_img = img.size
 
-    if tile_idx == 0:
-        print(f"  [DEBUG] Screenshot: {w_img}x{h_img} | tile_0 center: ({cx},{cy}) | crop radius: {TILE_CROP_PX}")
-
-    # 1. Pad-crop: always produce exactly TILE_CROP_PX*2 square regardless of edge proximity
-    full = Image.new("RGB", (TILE_CROP_PX * 2, TILE_CROP_PX * 2), (0, 0, 0))
+    # 1. Pad-crop: always produce exactly TILE_CROP_PX*2 square.
+    #    Use WHITE fill — training augmentation also used fill="white", so
+    #    any overflow area matches the training distribution.
+    full = Image.new("RGB", (TILE_CROP_PX * 2, TILE_CROP_PX * 2), (255, 255, 255))
     src_x1 = max(0, cx - TILE_CROP_PX)
     src_y1 = max(0, cy - TILE_CROP_PX)
     src_x2 = min(w_img, cx + TILE_CROP_PX)
@@ -165,36 +203,80 @@ def _get_model_prediction(img: Image.Image, tile_idx: int) -> str:
     paste_x = src_x1 - (cx - TILE_CROP_PX)
     paste_y = src_y1 - (cy - TILE_CROP_PX)
     full.paste(img.crop((src_x1, src_y1, src_x2, src_y2)), (paste_x, paste_y))
-    tile_img = full
 
-    # 2. Apply EXACT same Smart-Shave used during dataset training
-    w, h = tile_img.size
-    tile_img = tile_img.crop((65, 65, w - 65, h - 10))
-    
-    # 3. Format exactly to training shape input specification
-    tile_img = tile_img.convert("RGB").resize((64, 64)).convert("L")  # RGB first (matches training), then Grayscale
-    img_array = np.array(tile_img, dtype=np.float32)  # No manual normalize — Rescaling(1./255) layer handles it
-    img_array = np.expand_dims(img_array, axis=(0, -1))  # Shape -> (1, 64, 64, 1)
-    
-    # 4. Predict
-    predictions = model.predict(img_array, verbose=0)
-    class_idx = np.argmax(predictions[0])
-    
-    return CLASS_NAMES[class_idx].lower()
+    # 2. Apply the EXACT same shave used in generate_dataset.py
+    w, h = full.size
+    full = full.crop((65, 65, w - 65, h - 10))
+
+    # 3. Resize to model input size, convert to grayscale — matching
+    #    Keras color_mode="grayscale" + image_size=(64,64) from train_model.py
+    full = full.resize((64, 64)).convert("L")
+
+    return full
 
 
 def ocr_board(img: Image.Image) -> list[str]:
-    letters = []
+    global _scale_checked
+
+    w_img, h_img = img.size
+
+    # One-time sanity check that COORD_SCALE is plausible for this device
+    if not _scale_checked:
+        _scale_checked = True
+        print(f"  [OCR] Screenshot: {w_img}×{h_img} | "
+              f"tile_0 pixel centre: "
+              f"({int(TILE_COORDS[0][0]*COORD_SCALE)}, "
+              f"{int(TILE_COORDS[0][1]*COORD_SCALE)}) | "
+              f"COORD_SCALE={COORD_SCALE}")
+        _validate_coord_scale(w_img, h_img)
+
+    # Build a batch of all 16 preprocessed tiles in one pass
+    batch    = []   # will become shape (16, 64, 64, 1)
+    crops    = []   # keep PIL images for optional debug save
+    errored  = {}   # tile_idx -> True for any crop that failed
+
     for i in range(16):
         try:
-            letter = _get_model_prediction(img, i)
-            letters.append(letter)
+            tile_pil = _crop_tile(img, i)
+            arr = np.array(tile_pil, dtype=np.float32)   # (64, 64), values 0-255
+            batch.append(arr)
+            crops.append(tile_pil)
         except Exception as e:
-            print(f"  [CNN OCR Error] Tile {i} crash: {e}")
+            print(f"  [OCR] Tile {i} crop error: {e}")
+            batch.append(np.zeros((64, 64), dtype=np.float32))
+            crops.append(None)
+            errored[i] = True
+
+    # Single model.predict() call for all 16 tiles at once
+    batch_arr  = np.stack(batch, axis=0)           # (16, 64, 64)
+    batch_arr  = np.expand_dims(batch_arr, axis=-1) # (16, 64, 64, 1)
+    all_preds  = model.predict(batch_arr, verbose=0) # (16, num_classes)
+
+    letters = []
+    for i in range(16):
+        if i in errored:
             letters.append("?")
-            
+            continue
+
+        confidence = float(np.max(all_preds[i]))
+        class_idx  = int(np.argmax(all_preds[i]))
+        letter     = CLASS_NAMES[class_idx].lower()
+
+        # Low confidence → treat as unreadable rather than a wrong guess
+        if confidence < CONFIDENCE_THRESH:
+            letter = "?"
+
+        letters.append(letter)
+
+        # ── Debug: save the preprocessed 64×64 image the model received ──
+        if DEBUG_OCR and crops[i] is not None:
+            os.makedirs(DEBUG_OCR_DIR, exist_ok=True)
+            fname = f"{DEBUG_OCR_DIR}/tile_{i:02d}_{letter.upper()}_{confidence:.2f}.png"
+            # Save upscaled so it's easy to inspect
+            crops[i].resize((256, 256), Image.NEAREST).save(fname)
+
     s = "".join(l.upper() for l in letters)
-    print(f"  OCR[Local-CNN]: {s[:4]} {s[4:8]} {s[8:12]} {s[12:]}")
+    print(f"  OCR[CNN]: {s[:4]} {s[4:8]} {s[8:12]} {s[12:]}")
     return letters
 
 
