@@ -1,16 +1,17 @@
 """
-Boggle Bot — Deep Learning CNN Edition
+Boggle Bot — Shift-Tolerant Template Matching Edition
 ──────────────────────────────────────────────────────────────────────────
 Pipeline:
   1. Screenshot via WebDriverAgent
-  2. Crop 16 tiles -> Apply exact dataset "Shave" -> Batch to Tensor
-  3. CNN Inference (predicts all 16 letters instantly)
-  4. DFS solver over the curated dictionary
-  5. Swipe the best word's tile path on the board
-  6. Repeat on new board
+  2. Crop each board tile → Shift-tolerant Template Matching → letter (A-Z or QU)
+  3. DFS solver over the curated dictionary
+  4. Swipe the best word's tile path on the board
+  5. Repeat on new board
 
 Requirements:
-  pip install pillow numpy requests opencv-python tensorflow
+  pip install pillow numpy requests opencv-python
+
+No Tesseract binary required!
 """
 
 import argparse
@@ -24,40 +25,31 @@ import cv2
 from PIL import Image
 from io import BytesIO
 
-# Suppress TensorFlow terminal spam
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-import tensorflow as tf
-
 # ─────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────
 WDA_URL   = "http://localhost:8100"
 DICT_PATH = "Dictionary-curated.txt"
-MODEL_PATH = "perfect_ocr_model.h5"
 
 # ── Timing ──
-BOARD_WAIT_OCR = 0.55   
-HOLD_MS        = 50     
-TILE_PAUSE_MS  = 15     
-LIFT_DELAY_MS  = 120    
-IDLE_TIMEOUT   = 4.5    
+BOARD_WAIT_OCR = 0.55   # wait after swipe before next screenshot (tile animation)
+HOLD_MS        = 50     # initial press on first tile
+TILE_PAUSE_MS  = 15     # slide duration between tiles (>0 = interpolated)
+LIFT_DELAY_MS  = 120    # hold on last tile before lifting
+
+IDLE_TIMEOUT   = 4.5    # seconds with no successful swipe → assume round over
 
 # ── Word filtering ──
-MIN_WORD_LEN = 5   
+MIN_WORD_LEN = 5   # only play 5-7 letter words (best score/risk ratio)
 MAX_WORD_LEN = 7
 
-# ── Crop & Shave (CNN Params) ──
-COORD_SCALE  = 3.0    
-TILE_CROP_PX = 100    
-SHAVE_PIXELS = 65     
-CNN_TARGET_SIZE = (64, 64)
-CNN_CONFIDENCE_THRESHOLD = 0.60 
+# ── Crop ──
+COORD_SCALE  = 3.0    # physical px = WDA logical px × scale (3.0 for Retina)
+TILE_CROP_PX = 100    # half-side of square crop around each tile centre
 
-# Keras image_dataset_from_directory sorts classes alphanumerically
-CLASS_NAMES = [
-    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 
-    'n', 'o', 'p', 'q', 'qu', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'
-]
+# ── Template matching ──
+TEMPLATES_DIR         = "templates"
+_TMPL_MATCH_THRESHOLD = 0.85  # Perfect fits yield > 0.95. Anything below 0.85 is unrecognized.
 
 # ── 4×4 board tile coordinates (WDA logical px) ──
 TILE_COORDS = {
@@ -66,6 +58,7 @@ TILE_COORDS = {
      8: ( 85, 574),  9: (173, 572), 10: (266, 572), 11: (357, 564),
     12: ( 85, 662), 13: (177, 660), 14: (261, 656), 15: (362, 664),
 }
+
 
 # ─────────────────────────────────────────
 #  BOGGLE SCORING
@@ -90,15 +83,42 @@ LETTER_VALUE = {
 def tile_score(word: str) -> int:
     return boggle_score(word) + sum(LETTER_VALUE.get(c, 1) for c in word.lower())
 
+
 # ─────────────────────────────────────────
-#  CNN VISION ENGINE
+#  SHIFTS-TOLERANT MATCHING ENGINE
 # ─────────────────────────────────────────
-print("  [Init] Booting TensorFlow Vision Engine...")
-try:
-    ocr_model = tf.keras.models.load_model(MODEL_PATH)
-except Exception as e:
-    print(f"  [Error] Failed to load {MODEL_PATH}. Did you run train_model.py?")
-    exit(1)
+SIDE = TILE_CROP_PX * 2
+_auto_templates: dict = {}
+
+
+def _canonical_preprocess(crop: np.ndarray) -> np.ndarray:
+    """Creates a standardized binary canvas layout matching reference files."""
+    large    = cv2.resize(crop, (SIDE * 3, SIDE * 3), interpolation=cv2.INTER_CUBIC)
+    _, bw    = cv2.threshold(large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(bw) < 127:
+        bw = cv2.bitwise_not(bw)
+    return cv2.copyMakeBorder(bw, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+
+
+def load_templates(folder: str = TEMPLATES_DIR) -> None:
+    """Loads your manually named alphabet files from disk into memory."""
+    global _auto_templates
+    os.makedirs(folder, exist_ok=True)
+    loaded = {}
+    for fname in os.listdir(folder):
+        name, ext = os.path.splitext(fname)
+        if ext.lower() not in (".png", ".jpg", ".jpeg") or name.startswith("tile_"):
+            continue
+        label = name.upper()
+        path  = os.path.join(folder, fname)
+        img   = Image.open(path).convert("L").resize((SIDE * 3 + 40, SIDE * 3 + 40), Image.LANCZOS)
+        loaded[label.lower()] = np.array(img, dtype=np.float32)
+    _auto_templates = loaded
+    if loaded:
+        print(f"  [OCR] Loaded {len(loaded)} curated templates: {sorted(k.upper() for k in loaded)}")
+    else:
+        print(f"  [WARNING] No letter templates found! Please rename tile_xx.png files to letters (e.g., A.png)")
+
 
 def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
     cx = int(TILE_COORDS[idx][0] * COORD_SCALE)
@@ -110,66 +130,79 @@ def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
     y2 = min(h, cy + TILE_CROP_PX)
     return img_grey[y1:y2, x1:x2]
 
-def _canonical_preprocess(crop: np.ndarray) -> np.ndarray:
-    """Restored from your original script to match dataset generation!"""
-    # 1. Scale 200x200 up to 600x600
-    large = cv2.resize(crop, (TILE_CROP_PX * 6, TILE_CROP_PX * 6), interpolation=cv2.INTER_CUBIC)
-    
-    # 2. Threshold to pure "crazy clear" Black & White
-    _, bw = cv2.threshold(large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if np.mean(bw) < 127:
-        bw = cv2.bitwise_not(bw)
-        
-    # 3. Pad to 640x640
-    return cv2.copyMakeBorder(bw, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
 
-def _preprocess_for_cnn(crops: list) -> np.ndarray:
-    """Processes live game tiles identically to generate_dataset.py"""
-    batch = []
-    for crop in crops:
-        # First, turn the raw crop into the 640x640 B&W canvas your model trained on
-        canonical = _canonical_preprocess(crop)
+def _template_match(canonical: np.ndarray) -> tuple:
+    """Slides the master templates across a padded tile area to handle shifts."""
+    if not _auto_templates:
+        return "", -1.0
+    
+    # Pad search area by 12px to let templates safely slide if coordinates bounce
+    search_area = cv2.copyMakeBorder(canonical, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255)
+    search_area = search_area.astype(np.float32)
+    
+    best_letter, best_score = "", -1.0
+    for letter, tmpl in _auto_templates.items():
+        if tmpl.shape != canonical.shape:
+            continue
+            
+        res = cv2.matchTemplate(search_area, tmpl, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, _ = cv2.minMaxLoc(res)
         
-        # NOW apply the exact 65px shave to the 640x640 image
-        h, w = canonical.shape
-        shaved = canonical[SHAVE_PIXELS : h - 10, SHAVE_PIXELS : w - SHAVE_PIXELS]
-        
-        # Finally, squish to 64x64 for the CNN brain
-        resized = cv2.resize(shaved, CNN_TARGET_SIZE, interpolation=cv2.INTER_AREA)
-        
-        batch.append(np.expand_dims(resized, axis=-1))
-        
-    return np.array(batch, dtype=np.float32)
+        if max_val > best_score:
+            best_score, best_letter = max_val, letter
+            
+    return best_letter, best_score
+
+
+def _read_tile(img_grey: np.ndarray, idx: int) -> str:
+    crop = _crop_tile(img_grey, idx)
+    if crop.size == 0:
+        return "?"
+
+    canonical = _canonical_preprocess(crop)
+    letter, score = _template_match(canonical)
+    
+    if score >= _TMPL_MATCH_THRESHOLD:
+        return letter
+
+    print(f"  [OCR] Unknown character layout at tile {idx:02d} (Best guess: '{letter.upper()}' @ {score:.2f})")
+    return "?"
+
+
 def ocr_board(img: Image.Image) -> list:
-    """Reads all 16 tiles instantly using a single CNN batch prediction."""
+    """Reads all 16 tiles instantly over memory."""
     img_grey = np.array(img.convert("L"))
-    
-    # Extract 16 square crops
-    raw_crops = [_crop_tile(img_grey, i) for i in range(16)]
-    
-    # Preprocess all 16 at once
-    batch_tensor = _preprocess_for_cnn(raw_crops)
-    
-    # Inference! Pass the batch through the model
-    predictions = ocr_model.predict(batch_tensor, verbose=0)
-    
-    letters = []
-    for pred in predictions:
-        class_idx = np.argmax(pred)
-        confidence = pred[class_idx]
-        
-        if confidence >= CNN_CONFIDENCE_THRESHOLD:
-            letters.append(CLASS_NAMES[class_idx])
-        else:
-            letters.append("?")
+    letters = [_read_tile(img_grey, i) for i in range(16)]
 
-    # Format printout
     rows = [" ".join(f"{letters[r*4+c].upper():>2}" for c in range(4)) for r in range(4)]
-    print(f"  OCR[CNN]:   {rows[0]}")
+    print(f"  OCR[Match]: {rows[0]}")
     for row in rows[1:]:
         print(f"              {row}")
-        
     return letters
+
+
+# ─────────────────────────────────────────
+#  CALIBRATION
+# ─────────────────────────────────────────
+def calibrate():
+    os.makedirs(TEMPLATES_DIR, exist_ok=True)
+    print("  [calibrate] Connecting to WDA…")
+    get_session()
+    print("  [calibrate] Taking screenshot…")
+    img      = take_screenshot()
+    img_grey = np.array(img.convert("L"))
+    
+    for i in range(16):
+        crop = _crop_tile(img_grey, i)
+        if crop.size == 0:
+            continue
+        canonical = _canonical_preprocess(crop)
+        out_path  = os.path.join(TEMPLATES_DIR, f"tile_{i:02d}.png")
+        cv2.imwrite(out_path, canonical)
+        
+    print(f"\n  Saved 16 processed crops to ./{TEMPLATES_DIR}/")
+    print("  Please map these files to true letters (e.g., rename tile_00.png -> A.png)")
+
 
 # ─────────────────────────────────────────
 #  DICTIONARY
@@ -188,6 +221,7 @@ def load_dictionary(path: str = DICT_PATH):
             prefixes.add(w[:i])
     return words, prefixes
 
+
 # ─────────────────────────────────────────
 #  SOLVER & UTILS
 # ─────────────────────────────────────────
@@ -203,6 +237,7 @@ def _build_neighbours():
     return nb
 
 NEIGHBOURS = _build_neighbours()
+
 
 def solve_board(letters, words, prefixes):
     found = {}
@@ -227,15 +262,18 @@ def solve_board(letters, words, prefixes):
 
     return dict(sorted(found.items(), key=lambda x: (boggle_score(x[0]), len(x[0])), reverse=True))
 
+
 _http       = requests.Session()
 _http.headers.update({"Content-Type": "application/json"})
 _session_id = None
+
 
 def _create_session() -> str:
     r = _http.post(f"{WDA_URL}/session", json={"capabilities": {"alwaysMatch": {}}}, timeout=30)
     r.raise_for_status()
     sid = r.json().get("sessionId") or r.json().get("value", {}).get("sessionId")
     return sid
+
 
 def get_session() -> str:
     global _session_id
@@ -249,6 +287,7 @@ def get_session() -> str:
     except Exception: pass
     _session_id = _create_session()
     return _session_id
+
 
 def take_screenshot(retries: int = 3) -> Image.Image:
     global _session_id
@@ -266,6 +305,7 @@ def take_screenshot(retries: int = 3) -> Image.Image:
         except Exception:
             if attempt < retries - 1: time.sleep(0.2)
     raise RuntimeError("Screenshot failed.")
+
 
 def swipe_path(indices):
     sid    = get_session()
@@ -287,6 +327,7 @@ def swipe_path(indices):
         return r.status_code == 200
     except Exception: return False
 
+
 def _tier(w: str) -> int:
     n = len(w)
     if n == 7: return 3
@@ -294,11 +335,13 @@ def _tier(w: str) -> int:
     if n == 5: return 1
     return 0
 
+
 def run():
+    load_templates()
     words, prefixes = load_dictionary(DICT_PATH)
 
     print("\n" + "=" * 54)
-    print("   Boggle Bot  ⚡  CNN Vision Edition")
+    print("   Boggle Bot  ⚡  Template Matching Edition")
     print("=" * 54)
     get_session()
 
@@ -412,7 +455,13 @@ def run():
             print(f"  Error: {e}")
             time.sleep(2)
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Boggle Bot — CNN Vision Edition")
+    parser = argparse.ArgumentParser(description="Boggle Bot — Template Matching Edition")
+    parser.add_argument("--calibrate", action="store_true", help="Extract templates.")
     args = parser.parse_args()
-    run()
+
+    if args.calibrate:
+        calibrate()
+    else:
+        run()
