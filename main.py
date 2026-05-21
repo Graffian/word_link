@@ -50,7 +50,7 @@ MAX_WORD_LEN = 7
 
 # ── Crop & Shave (CNN Params) ──
 COORD_SCALE  = 3.0    
-TILE_CROP_PX = 320    # 320 radius = 640x640 total square (Matches your dataset bases!)
+TILE_CROP_PX = 100    # 320 radius = 640x640 total square (Matches your dataset bases!)
 SHAVE_PIXELS = 65     
 CNN_TARGET_SIZE = (64, 64)
 CNN_CONFIDENCE_THRESHOLD = 0.60
@@ -148,6 +148,73 @@ def _preprocess_for_cnn(crops: list) -> np.ndarray:
         
     return np.array(batch, dtype=np.float32)
 def ocr_board(img: Image.Image) -> list:
+    """Reads all 16 tiles instantly using a single CNN batch prediction."""
+    batch = []
+    w_img, h_img = img.size
+    
+    for i in range(16):
+        # 1. Map to exact center coordinates
+        cx = int(TILE_COORDS[i][0] * COORD_SCALE)
+        cy = int(TILE_COORDS[i][1] * COORD_SCALE)
+        
+        # 2. Grab the tightly bound 200x200 tile from the screenshot
+        x1, y1 = max(0, cx - TILE_CROP_PX), max(0, cy - TILE_CROP_PX)
+        x2, y2 = min(w_img, cx + TILE_CROP_PX), min(h_img, cy + TILE_CROP_PX)
+        tile_img = img.crop((x1, y1, x2, y2))
+        
+        # 3. Scale up to 600x600 (Matching your canonical dataset builder)
+        tile_img = tile_img.resize((600, 600), Image.Resampling.LANCZOS)
+        
+        # 4. Pad 20px to 640x640 with a white background
+        padded_img = Image.new("RGB", (640, 640), "white")
+        padded_img.paste(tile_img, (20, 20))
+        
+        # 5. Apply the Smart-Shave to cut away the UI dots
+        w, h = padded_img.size
+        shaved_img = padded_img.crop((SHAVE_PIXELS, SHAVE_PIXELS, w - SHAVE_PIXELS, h - 10))
+        
+        # 6. Squish down to the 64x64 brain size and grayscale
+        final_img = shaved_img.resize(CNN_TARGET_SIZE, Image.Resampling.LANCZOS).convert("L")
+        
+        # --- DEBUG VISION DUMP ---
+        if DEBUG_MODE:
+            os.makedirs("debug_vision", exist_ok=True)
+            final_img.save(f"debug_vision/tile_{i:02d}.png")
+            
+        # 7. Normalize mathematically for the model (/ 255.0)
+        img_array = np.array(final_img, dtype=np.float32) / 255.0
+        batch.append(np.expand_dims(img_array, axis=-1))
+
+    # Batch shape becomes (16, 64, 64, 1)
+    batch_tensor = np.array(batch)
+    
+    # Inference!
+    predictions = ocr_model.predict(batch_tensor, verbose=0)
+    
+    letters = []
+    for i, pred in enumerate(predictions):
+        class_idx = np.argmax(pred)
+        confidence = pred[class_idx]
+        
+        if DEBUG_MODE:
+            print(f"  [Debug] Tile {i:02d} Top 3:")
+            top_3_idx = np.argsort(pred)[-3:][::-1]
+            for idx in top_3_idx:
+                print(f"          {CLASS_NAMES[idx].upper():>2} : {pred[idx]*100:>5.1f}%")
+        
+        # We can drop the confidence threshold slightly since your model is so accurate
+        if confidence >= 0.40:
+            letters.append(CLASS_NAMES[class_idx])
+        else:
+            letters.append("?")
+
+    # Format printout
+    rows = [" ".join(f"{letters[r*4+c].upper():>2}" for c in range(4)) for r in range(4)]
+    print(f"\n  OCR[CNN]:   {rows[0]}")
+    for row in rows[1:]:
+        print(f"              {row}")
+        
+    return [l.lower() for l in letters]
     """Reads all 16 tiles instantly using a single CNN batch prediction."""
     batch = []
     w_img, h_img = img.size
