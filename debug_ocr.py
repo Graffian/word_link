@@ -144,8 +144,11 @@ for i in range(16):
 
     inner = full.crop((shave_l, shave_t, w - shave_r, h - shave_b))
 
-    # 4. Same resize + grayscale mapping to 64x64
+    # 4. Resize and convert to grayscale
     full = inner.resize((64, 64)).convert("L")
+
+    # 5. B&W THRESHOLDING (Strips away shading/gradients)
+    full = full.point(lambda p: 255 if p > 150 else 0)
 
     tiles_pil.append(full)
     batch.append(np.array(full, dtype=np.float32))
@@ -164,7 +167,7 @@ for i in range(16):
 
     print(f"  {i:>4}  {pred:>4}  {conf:>5.1%}  {second:>4}  {conf2:>6.1%}  {status}")
 
-    # Save the 64×64 grayscale tile scaled up 4× for easy inspection
+    # Save the 64×64 stark black-and-white tile scaled up 4× for easy inspection
     fname = f"{OUT_DIR}/tile_{i:02d}_{pred}_{conf:.2f}.png"
     tiles_pil[i].resize((256, 256), Image.NEAREST).save(fname)
 

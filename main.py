@@ -185,15 +185,14 @@ _scale_checked = False  # only validate once per run
 
 def _crop_tile(img: Image.Image, tile_idx: int) -> Image.Image:
     """
-    Crop exactly ONE tile from the screenshot and proportionally shave it 
-    to match the exact 64x64 squished shape the CNN expects.
+    Crop and preprocess one tile to exactly match the training data:
+    tight crop -> proportional shave -> threshold to pure B&W -> 64x64.
     """
     cx = int(TILE_COORDS[tile_idx][0] * COORD_SCALE)
     cy = int(TILE_COORDS[tile_idx][1] * COORD_SCALE)
-    
-    # 1. Determine actual tile size on screen. 
-    # The X distance between col 0 and col 1 is (170 - 84) = 86 logical pixels.
-    # We use a radius of 43 logical pixels to tightly isolate just one tile.
+    w_img, h_img = img.size
+
+    # 1. Base tile size calculation (43 logical radius isolates exactly one tile safely)
     logical_radius = 43
     phys_radius = int(logical_radius * COORD_SCALE)
     side = phys_radius * 2
@@ -202,27 +201,31 @@ def _crop_tile(img: Image.Image, tile_idx: int) -> Image.Image:
     full = Image.new("RGB", (side, side), (255, 255, 255))
     src_x1 = max(0, cx - phys_radius)
     src_y1 = max(0, cy - phys_radius)
-    src_x2 = min(img.width, cx + phys_radius)
-    src_y2 = min(img.height, cy + phys_radius)
-
+    src_x2 = min(w_img, cx + phys_radius)
+    src_y2 = min(h_img, cy + phys_radius)
+    
     paste_x = src_x1 - (cx - phys_radius)
     paste_y = src_y1 - (cy - phys_radius)
     full.paste(img.crop((src_x1, src_y1, src_x2, src_y2)), (paste_x, paste_y))
 
-    # 3. Apply PROPORTIONAL shave to match the 640x640 training data.
-    # The training data shaved (65, 65, 65, 10) off a 640x640 asset.
-    # This is ~10.15% off L/T/R and ~1.5% off Bottom.
+    # 3. Proportional shave to match the 640x640 squish ratio from training
     w, h = full.size
     shave_l = int(w * (65 / 640))
     shave_t = int(h * (65 / 640))
     shave_r = int(w * (65 / 640))
     shave_b = int(h * (10 / 640))
 
-    inner = full.crop((shave_l, shave_t, w - shave_r, h - shave_b))
+    full = full.crop((shave_l, shave_t, w - shave_r, h - shave_b))
 
-    # 4. Resize to 64x64 and convert to Grayscale.
-    # This intentionally replicates the exact stretch/squish seen in C_0.png
-    return inner.resize((64, 64)).convert("L")
+    # 4. Resize and convert to grayscale first
+    full = full.resize((64, 64)).convert("L")
+
+    # 5. B&W THRESHOLDING (The "Just an E and a dot" magic)
+    # Any pixel lighter than 150 turns pure white (255), darker turns pure black (0)
+    # Adjust 150 up or down slightly if the dots are getting wiped out or gray is surviving
+    full = full.point(lambda p: 255 if p > 150 else 0)
+
+    return full
 
 
 def ocr_board(img: Image.Image) -> list[str]:
