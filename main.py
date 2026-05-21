@@ -57,8 +57,8 @@ CNN_CONFIDENCE_THRESHOLD = 0.60
 
 # Keras image_dataset_from_directory sorts classes alphanumerically
 CLASS_NAMES = [
-    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 
-    'n', 'o', 'p', 'q', 'qu', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 
+    'N', 'O', 'P', 'Q', 'QU', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'
 ]
 
 # ── 4×4 board tile coordinates (WDA logical px) ──
