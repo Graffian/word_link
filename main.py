@@ -246,7 +246,7 @@ def solve_board(letters, words, prefixes):
         if ch and ch != "?":
             dfs(i, ch, [i], {i})
 
-    return dict(sorted(found.items(), key=lambda x: (boggle_score(x[0]), len(x[0])), reverse=True))
+    return found  # caller sorts by tile_score; no need to pre-sort here
 
 
 # ─────────────────────────────────────────
@@ -352,17 +352,25 @@ def run():
                 time.sleep(3.0)
                 continue
 
-            # Re-solve whenever the board changes (or a swipe just ran)
-            board_changed    = (letters != last_letters) or board_will_change
+            # Re-solve on genuine board change OR when a swipe just completed.
+            # IMPORTANT: only clear `played` on a real letter change — not after
+            # every swipe — otherwise the bot would endlessly replay the same word.
+            force_resolv      = board_will_change
+            board_changed     = (letters != last_letters)
             board_will_change = False
 
-            if board_changed:
+            if board_changed or force_resolv:
                 n_diff = sum(1 for a, b in zip(letters, last_letters) if a != b) if last_letters else 16
-                if last_letters:
-                    tag = "refreshed" if n_diff > 0 else "OCR same but swipe ran — forcing re-solve"
-                    print(f"  [board] {n_diff}/16 tiles {tag}")
-                played.clear()
-                last_letters = letters[:]
+                if last_letters and board_changed:
+                    print(f"  [board] {n_diff}/16 tiles refreshed — new board detected")
+                elif force_resolv and not board_changed:
+                    print(f"  [board] re-solving after swipe (same letters, {len(played)} words already played)")
+
+                if board_changed:
+                    # Genuine new board → reset everything
+                    played.clear()
+                    last_letters = letters[:]
+
                 t0      = time.perf_counter()
                 results = solve_board(letters, words, prefixes)
                 elapsed = time.perf_counter() - t0
@@ -374,9 +382,10 @@ def run():
                 in_game = True
 
             # ── Pick best unplayed word ──────────────────────────────────────
-            # Priority tiers: 7-letter → 6-letter → 5-letter
+            # Priority tiers: 8+ letter → 7-letter → 6-letter → 5-letter
             def _tier(w: str) -> int:
                 n = len(w)
+                if n >= 8: return 4   # Boggle max score (11 pts) — never skip these
                 if n == 7: return 3
                 if n == 6: return 2
                 if n == 5: return 1
@@ -384,7 +393,7 @@ def run():
 
             candidates = [
                 (w, p) for w, p in results.items()
-                if w not in played and 5 <= len(w) <= 7
+                if w not in played and len(w) >= 5   # include all 5+ letter words
             ]
 
             remaining = sorted(
@@ -394,7 +403,7 @@ def run():
             )
 
             if not remaining:
-                print("  No unplayed 5-7 letter words on this board — waiting for next...")
+                print("  No unplayed 5+ letter words on this board — waiting for next...")
                 in_game = False
                 time.sleep(2.0)
                 continue
