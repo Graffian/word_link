@@ -1,3 +1,18 @@
+"""
+Boggle Bot — Deep Learning CNN Edition
+──────────────────────────────────────────────────────────────────────────
+Pipeline:
+  1. Screenshot via WebDriverAgent
+  2. Crop 16 tiles -> Apply exact dataset "Shave" -> Batch to Tensor
+  3. CNN Inference (predicts all 16 letters instantly)
+  4. DFS solver over the curated dictionary
+  5. Swipe the best word's tile path on the board
+  6. Repeat on new board
+
+Requirements:
+  pip install pillow numpy requests opencv-python tensorflow
+"""
+
 import argparse
 import requests
 import time
@@ -5,6 +20,7 @@ import base64
 import os
 import threading
 import numpy as np
+import cv2
 from PIL import Image
 from io import BytesIO
 
@@ -24,9 +40,7 @@ BOARD_WAIT_OCR = 0.55
 HOLD_MS        = 50     
 TILE_PAUSE_MS  = 15     
 LIFT_DELAY_MS  = 120    
-IDLE_TIMEOUT   = 4.5   
-
-DEBUG_MODE = False
+IDLE_TIMEOUT   = 4.5    
 
 # ── Word filtering ──
 MIN_WORD_LEN = 5   
@@ -34,15 +48,15 @@ MAX_WORD_LEN = 7
 
 # ── Crop & Shave (CNN Params) ──
 COORD_SCALE  = 3.0    
-TILE_CROP_PX = 100    # 100 radius = 200x200 physical screen tile
+TILE_CROP_PX = 100    
 SHAVE_PIXELS = 65     
 CNN_TARGET_SIZE = (64, 64)
-CNN_CONFIDENCE_THRESHOLD = 0.40
+CNN_CONFIDENCE_THRESHOLD = 0.60 
 
 # Keras image_dataset_from_directory sorts classes alphanumerically
 CLASS_NAMES = [
-    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 
-    'N', 'O', 'P', 'Q', 'QU', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 
+    'n', 'o', 'p', 'q', 'qu', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'
 ]
 
 # ── 4×4 board tile coordinates (WDA logical px) ──
@@ -86,60 +100,51 @@ except Exception as e:
     print(f"  [Error] Failed to load {MODEL_PATH}. Did you run train_model.py?")
     exit(1)
 
+def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
+    cx = int(TILE_COORDS[idx][0] * COORD_SCALE)
+    cy = int(TILE_COORDS[idx][1] * COORD_SCALE)
+    h, w = img_grey.shape[:2]
+    x1 = max(0, cx - TILE_CROP_PX)
+    y1 = max(0, cy - TILE_CROP_PX)
+    x2 = min(w, cx + TILE_CROP_PX)
+    y2 = min(h, cy + TILE_CROP_PX)
+    return img_grey[y1:y2, x1:x2]
+
+def _preprocess_for_cnn(crops: list) -> np.ndarray:
+    """Takes 16 raw crops, shaves them matching the dataset, and batches them."""
+    batch = []
+    for crop in crops:
+        h, w = crop.shape
+        
+        # Exact shave logic from generate_dataset.py
+        # Numpy slicing is [Y, X] -> [top:bottom, left:right]
+        shaved = crop[SHAVE_PIXELS : h - 10, SHAVE_PIXELS : w - SHAVE_PIXELS]
+        
+        # Resize to 64x64 for the CNN
+        resized = cv2.resize(shaved, CNN_TARGET_SIZE, interpolation=cv2.INTER_AREA)
+        
+        # Add the channel dimension so shape is (64, 64, 1)
+        batch.append(np.expand_dims(resized, axis=-1))
+        
+    return np.array(batch, dtype=np.float32)
+
 def ocr_board(img: Image.Image) -> list:
     """Reads all 16 tiles instantly using a single CNN batch prediction."""
-    batch = []
-    w_img, h_img = img.size
+    img_grey = np.array(img.convert("L"))
     
-    for i in range(16):
-        # 1. Map to exact center coordinates
-        cx = int(TILE_COORDS[i][0] * COORD_SCALE)
-        cy = int(TILE_COORDS[i][1] * COORD_SCALE)
-        
-        # 2. Grab the tightly bound 200x200 tile from the screenshot
-        x1, y1 = max(0, cx - TILE_CROP_PX), max(0, cy - TILE_CROP_PX)
-        x2, y2 = min(w_img, cx + TILE_CROP_PX), min(h_img, cy + TILE_CROP_PX)
-        tile_img = img.crop((x1, y1, x2, y2))
-        
-        # 3. Scale up to 600x600 (Matching your canonical dataset builder)
-        tile_img = tile_img.resize((600, 600), Image.Resampling.LANCZOS)
-        
-        # 4. Pad 20px to 640x640 with a white background
-        padded_img = Image.new("RGB", (640, 640), "white")
-        padded_img.paste(tile_img, (20, 20))
-        
-        # 5. Apply the Smart-Shave to cut away the UI dots
-        w, h = padded_img.size
-        shaved_img = padded_img.crop((SHAVE_PIXELS, SHAVE_PIXELS, w - SHAVE_PIXELS, h - 10))
-        
-        # 6. Squish down to the 64x64 brain size and grayscale
-        final_img = shaved_img.resize(CNN_TARGET_SIZE, Image.Resampling.LANCZOS).convert("L")
-        
-        # --- DEBUG VISION DUMP ---
-        if DEBUG_MODE:
-            os.makedirs("debug_vision", exist_ok=True)
-            final_img.save(f"debug_vision/tile_{i:02d}.png")
-            
-        # 7. Normalize mathematically for the model (/ 255.0)
-        img_array = np.array(final_img, dtype=np.float32) / 255.0
-        batch.append(np.expand_dims(img_array, axis=-1))
-
-    # Batch shape becomes (16, 64, 64, 1)
-    batch_tensor = np.array(batch)
+    # Extract 16 square crops
+    raw_crops = [_crop_tile(img_grey, i) for i in range(16)]
     
-    # Inference!
+    # Preprocess all 16 at once
+    batch_tensor = _preprocess_for_cnn(raw_crops)
+    
+    # Inference! Pass the batch through the model
     predictions = ocr_model.predict(batch_tensor, verbose=0)
     
     letters = []
-    for i, pred in enumerate(predictions):
+    for pred in predictions:
         class_idx = np.argmax(pred)
         confidence = pred[class_idx]
-        
-        if DEBUG_MODE:
-            print(f"  [Debug] Tile {i:02d} Top 3:")
-            top_3_idx = np.argsort(pred)[-3:][::-1]
-            for idx in top_3_idx:
-                print(f"          {CLASS_NAMES[idx].upper():>2} : {pred[idx]*100:>5.1f}%")
         
         if confidence >= CNN_CONFIDENCE_THRESHOLD:
             letters.append(CLASS_NAMES[class_idx])
@@ -148,11 +153,11 @@ def ocr_board(img: Image.Image) -> list:
 
     # Format printout
     rows = [" ".join(f"{letters[r*4+c].upper():>2}" for c in range(4)) for r in range(4)]
-    print(f"\n  OCR[CNN]:   {rows[0]}")
+    print(f"  OCR[CNN]:   {rows[0]}")
     for row in rows[1:]:
         print(f"              {row}")
         
-    return [l.lower() for l in letters]
+    return letters
 
 # ─────────────────────────────────────────
 #  DICTIONARY
@@ -397,10 +402,5 @@ def run():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Boggle Bot — CNN Vision Edition")
-    parser.add_argument("--debug", action="store_true", help="Dump CNN inputs and confidence scores.")
     args = parser.parse_args()
-    
-    if args.debug:
-        DEBUG_MODE = True
-        
     run()
