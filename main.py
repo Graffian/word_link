@@ -164,13 +164,21 @@ def _get_model_prediction(img: Image.Image, tile_idx: int) -> str:
     
     # 3. Format exactly to training shape input specification
     tile_img = tile_img.convert("RGB").resize((64, 64)).convert("L")  # RGB first (matches training), then Grayscale
+
+    # ── DEBUG ──
+    os.makedirs("debug_tiles", exist_ok=True)
+    tile_img.save(f"debug_tiles/tile_{tile_idx}.png")
+    # ───────────
+
     img_array = np.array(tile_img, dtype=np.float32)  # No manual normalize — Rescaling(1./255) layer handles it
     img_array = np.expand_dims(img_array, axis=(0, -1))  # Shape -> (1, 64, 64, 1)
     
     # 4. Predict
     predictions = model.predict(img_array, verbose=0)
     class_idx = np.argmax(predictions[0])
-    
+    confidence = predictions[0][class_idx]
+    print(f"  [DEBUG] tile_{tile_idx}: {CLASS_NAMES[class_idx]} ({confidence*100:.1f}%)")
+
     return CLASS_NAMES[class_idx].lower()
 
 
