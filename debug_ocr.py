@@ -75,8 +75,8 @@ print(f"  Saved: {OUT_DIR}/00_full_screenshot.png")
 annotated = screenshot.copy().convert("RGB")
 draw = ImageDraw.Draw(annotated)
 
-# 43 logical pixels radius isolates exactly one tile safely
-logical_radius = 43
+# 38 logical pixels radius tightly bounds the letter/dots and avoids the tile edge
+logical_radius = 38
 phys_radius = int(logical_radius * COORD_SCALE)
 
 for idx, (lx, ly) in TILE_COORDS.items():
@@ -101,7 +101,7 @@ preview_h = int(h_img * scale_factor)
 annotated_small = annotated.resize((preview_w, preview_h), Image.LANCZOS)
 annotated_small.save(f"{OUT_DIR}/01_tile_positions.png")
 print(f"  Saved: {OUT_DIR}/01_tile_positions.png")
-print(f"  ↳  Open this to verify the red boxes are centred on each tile.")
+print(f"  ↳  Open this to verify the red boxes fit neatly inside the flat white area of each tile.")
 
 # ── 3. Load model ─────────────────────────────────────────────────────────────
 print(f"\nLoading model: {MODEL_PATH}")
@@ -121,33 +121,21 @@ for i in range(16):
     cx = int(lx * COORD_SCALE)
     cy = int(ly * COORD_SCALE)
 
-    # 1. Base tile size calculation
-    side = phys_radius * 2
-
-    # 2. Extract strictly the single tile, padded with white if it hits an edge
-    full = Image.new("RGB", (side, side), (255, 255, 255))
-    src_x1 = max(0, cx - phys_radius)
-    src_y1 = max(0, cy - phys_radius)
-    src_x2 = min(w_img, cx + phys_radius)
-    src_y2 = min(h_img, cy + phys_radius)
+    # 1. Calculate the tight bounding box
+    box = (
+        max(0, cx - phys_radius),
+        max(0, cy - phys_radius),
+        min(w_img, cx + phys_radius),
+        min(h_img, cy + phys_radius)
+    )
     
-    paste_x = src_x1 - (cx - phys_radius)
-    paste_y = src_y1 - (cy - phys_radius)
-    full.paste(screenshot.crop((src_x1, src_y1, src_x2, src_y2)), (paste_x, paste_y))
+    # 2. Extract strictly the single tile face
+    full = screenshot.crop(box)
 
-    # 3. Apply PROPORTIONAL shave to match the 640x640 training data asset squish
-    w, h = full.size
-    shave_l = int(w * (65 / 640))
-    shave_t = int(h * (65 / 640))
-    shave_r = int(w * (65 / 640))
-    shave_b = int(h * (10 / 640))
+    # 3. Resize and convert to grayscale to match model dimensions
+    full = full.resize((64, 64)).convert("L")
 
-    inner = full.crop((shave_l, shave_t, w - shave_r, h - shave_b))
-
-    # 4. Resize and convert to grayscale
-    full = inner.resize((64, 64)).convert("L")
-
-    # 5. B&W THRESHOLDING (Strips away shading/gradients)
+    # 4. Stark black & white thresholding (strips away shading/anti-aliasing)
     full = full.point(lambda p: 255 if p > 150 else 0)
 
     tiles_pil.append(full)
