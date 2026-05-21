@@ -1,68 +1,63 @@
+"""
+Boggle Bot — Shift-Tolerant Template Matching Edition
+──────────────────────────────────────────────────────────────────────────
+Pipeline:
+  1. Screenshot via WebDriverAgent
+  2. Crop each board tile → Shift-tolerant Template Matching → letter (A-Z or QU)
+  3. DFS solver over the curated dictionary
+  4. Swipe the best word's tile path on the board
+  5. Repeat on new board
+
+Requirements:
+  pip install pillow numpy requests opencv-python
+
+No Tesseract binary required!
+"""
+
+import argparse
 import requests
 import time
 import base64
-import re
-import threading
 import os
-
-
-
-
+import threading
 import numpy as np
+import cv2
 from PIL import Image
 from io import BytesIO
-
-import tensorflow as tf
-
 
 # ─────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────
-WDA_URL        = "http://localhost:8100"
-DICT_PATH      = "Dictionary-curated.txt"
-MODEL_PATH     = "perfect_ocr_model.h5"
+WDA_URL   = "http://localhost:8100"
+DICT_PATH = "Dictionary-curated.txt"
 
 # ── Timing ──
-BOARD_WAIT_OCR  = 0.50
-BOARD_WAIT_FAST = 0.11
-HOLD_MS         = 50   # slightly longer initial press so game registers touch
-TILE_PAUSE_MS   = 15   # ms to slide between each tile
-LIFT_DELAY_MS   = 120  # ms to hold on the LAST tile before lifting
+BOARD_WAIT_OCR = 0.55   # wait after swipe before next screenshot (tile animation)
+HOLD_MS        = 50     # initial press on first tile
+TILE_PAUSE_MS  = 15     # slide duration between tiles (>0 = interpolated)
+LIFT_DELAY_MS  = 120    # hold on last tile before lifting
 
-IDLE_TIMEOUT     = 4.5
-DIRTY_TILE_LIMIT = 10
+IDLE_TIMEOUT   = 4.5    # seconds with no successful swipe → assume round over
 
 # ── Word filtering ──
-MIN_WORD_LEN = 3   # game requires 3+
+MIN_WORD_LEN = 5   # only play 5-7 letter words (best score/risk ratio)
+MAX_WORD_LEN = 7
 
+# ── Crop ──
+COORD_SCALE  = 3.0    # physical px = WDA logical px × scale (3.0 for Retina)
+TILE_CROP_PX = 100    # half-side of square crop around each tile centre
+
+# ── Template matching ──
+TEMPLATES_DIR         = "templates"
+_TMPL_MATCH_THRESHOLD = 0.85  # Perfect fits yield > 0.95. Anything below 0.85 is unrecognized.
+
+# ── 4×4 board tile coordinates (WDA logical px) ──
 TILE_COORDS = {
-     0: (  86,  391),  1: ( 174,  391),  2: ( 263,  391),  3: ( 352,  391),
-     4: (  86,  480),  5: ( 174,  480),  6: ( 263,  480),  7: ( 352,  480),
-     8: (  86,  569),  9: ( 174,  569), 10: ( 263,  569), 11: ( 352,  569),
-    12: (  86,  658), 13: ( 174,  658), 14: ( 263,  658), 15: ( 352,  658),
+     0: ( 88, 393),  1: (174, 398),  2: (260, 396),  3: (349, 393),
+     4: ( 82, 483),  5: (175, 482),  6: (258, 477),  7: (361, 486),
+     8: ( 85, 574),  9: (173, 572), 10: (266, 572), 11: (357, 564),
+    12: ( 85, 662), 13: (177, 660), 14: (261, 656), 15: (362, 664),
 }
-
-COORD_SCALE  = 3.0
-TILE_CROP_PX = 320    # Radius of square crop around centre to get full 640x640 base tile
-
-# ── OCR Debug ──
-# Set to True once to dump every preprocessed tile to debug_tiles/ so you
-# can visually verify what the model is actually seeing.
-DEBUG_OCR         = False
-DEBUG_OCR_DIR     = "debug_tiles"
-# Predictions below this confidence are returned as "?" (likely off-board)
-CONFIDENCE_THRESH = 0.50
-
-# Exact alphabetical order matching tf.keras.preprocessing.image_dataset_from_directory
-CLASS_NAMES = [
-    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 
-    'N', 'O', 'P', 'Q', 'QU', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'
-]
-
-# ── Load Neural Network ──
-print("🧠 Loading perfect_ocr_model.h5...")
-model = tf.keras.models.load_model(MODEL_PATH)
-print("✓ CNN Brain initialized successfully.")
 
 
 # ─────────────────────────────────────────
@@ -86,199 +81,139 @@ LETTER_VALUE = {
 }
 
 def tile_score(word: str) -> int:
-    """Total letter value + length bonus — approximates actual game score."""
-    letter_pts = sum(LETTER_VALUE.get(c, 1) for c in word.lower())
-    return boggle_score(word) + letter_pts
+    return boggle_score(word) + sum(LETTER_VALUE.get(c, 1) for c in word.lower())
 
 
 # ─────────────────────────────────────────
-#  SESSION MANAGEMENT
+#  SHIFTS-TOLERANT MATCHING ENGINE
 # ─────────────────────────────────────────
-_http       = requests.Session()
-_http.headers.update({"Content-Type": "application/json"})
-_session_id = None
+SIDE = TILE_CROP_PX * 2
+_auto_templates: dict = {}
 
 
-def _create_session() -> str:
-    r = _http.post(f"{WDA_URL}/session",
-                   json={"capabilities": {"alwaysMatch": {}}}, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    sid  = data.get("sessionId") or data.get("value", {}).get("sessionId")
-    if not sid:
-        raise RuntimeError(f"No sessionId in WDA response: {data}")
-    print(f"  [WDA] New session: {sid}")
-    return sid
+def _canonical_preprocess(crop: np.ndarray) -> np.ndarray:
+    """Creates a standardized binary canvas layout matching reference files."""
+    large    = cv2.resize(crop, (SIDE * 3, SIDE * 3), interpolation=cv2.INTER_CUBIC)
+    _, bw    = cv2.threshold(large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(bw) < 127:
+        bw = cv2.bitwise_not(bw)
+    return cv2.copyMakeBorder(bw, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
 
 
-def get_session() -> str:
-    global _session_id
-    if _session_id:
-        return _session_id
-    try:
-        r   = _http.get(f"{WDA_URL}/status", timeout=8)
-        sid = r.json().get("sessionId") or r.json().get("value", {}).get("sessionId")
-        if sid:
-            print(f"  [WDA] Reusing session: {sid}")
-            _session_id = sid
-            return _session_id
-    except Exception:
-        pass
-    _session_id = _create_session()
-    return _session_id
-
-
-# ─────────────────────────────────────────
-#  SCREENSHOT
-# ─────────────────────────────────────────
-def take_screenshot(retries: int = 3) -> Image.Image:
-    global _session_id
-    for attempt in range(retries):
-        try:
-            r = _http.get(f"{WDA_URL}/session/{_session_id}/screenshot", timeout=10)
-            if r.status_code == 404:
-                print("  [screenshot] Session gone — resetting")
-                _session_id = None
-                get_session()
-                continue
-            r.raise_for_status()
-            raw = r.json().get("value", "")
-            if isinstance(raw, dict):
-                raw = raw.get("value", "")
-            return Image.open(BytesIO(base64.b64decode(raw)))
-        except Exception as e:
-            print(f"  [screenshot] attempt {attempt + 1} failed: {e}")
-            if attempt < retries - 1:
-                time.sleep(0.2)
-    raise RuntimeError("Screenshot failed after all retries.")
-
-
-# ─────────────────────────────────────────
-#  HIGH-SPEED CNN INFERENCE OCR
-# ─────────────────────────────────────────
-
-def _validate_coord_scale(w_img: int, h_img: int) -> None:
-    """
-    Warn once if COORD_SCALE looks wrong for this screenshot.
-    WDA can return screenshots at 1x, 2x, or 3x depending on device + config.
-    A 3x iPhone 14 Pro is 1290×2796; 2x would be 828×1792; 1x ~390×844.
-    The rightmost tile centre (tile 3) in logical coords is x=345.  At the
-    current COORD_SCALE that maps to x={int(345*COORD_SCALE)}.
-    If that pixel is outside the screenshot width, COORD_SCALE is wrong.
-    """
-    max_logical_x = max(x for x, _ in TILE_COORDS.values())
-    max_logical_y = max(y for _, y in TILE_COORDS.values())
-    if int(max_logical_x * COORD_SCALE) >= w_img or int(max_logical_y * COORD_SCALE) >= h_img:
-        # Try to suggest the correct scale
-        for scale in (1.0, 2.0, 3.0):
-            if int(max_logical_x * scale) < w_img and int(max_logical_y * scale) < h_img:
-                print(f"  ⚠️  [OCR] COORD_SCALE={COORD_SCALE} maps tiles outside the "
-                      f"{w_img}×{h_img} screenshot! "
-                      f"Try setting COORD_SCALE = {scale}")
-                break
-        else:
-            print(f"  ⚠️  [OCR] COORD_SCALE={COORD_SCALE} looks wrong for {w_img}×{h_img} "
-                  f"screenshot. Check TILE_COORDS match the current device.")
-
-_scale_checked = False  # only validate once per run
-
-
-def _crop_tile(img: Image.Image, tile_idx: int) -> Image.Image:
-    cx = int(TILE_COORDS[tile_idx][0] * COORD_SCALE)
-    cy = int(TILE_COORDS[tile_idx][1] * COORD_SCALE)
-
-    # 1. Use the tight crop that avoids tile borders
-    logical_radius = 38
-    phys_radius = int(logical_radius * COORD_SCALE)
-    
-    box = (
-        max(0, cx - phys_radius),
-        max(0, cy - phys_radius),
-        min(img.size[0], cx + phys_radius),
-        min(img.size[1], cy + phys_radius)
-    )
-    
-    tile = img.crop(box)
-    
-    # 2. Resize and convert to grayscale naturally (NO harsh thresholding)
-    tile = tile.resize((64, 64)).convert("L")
-
-    return tile
-
-
-def ocr_board(img: Image.Image) -> list[str]:
-    global _scale_checked
-
-    w_img, h_img = img.size
-
-    # One-time sanity check that COORD_SCALE is plausible for this device
-    if not _scale_checked:
-        _scale_checked = True
-        print(f"  [OCR] Screenshot: {w_img}×{h_img} | "
-              f"tile_0 pixel centre: "
-              f"({int(TILE_COORDS[0][0]*COORD_SCALE)}, "
-              f"{int(TILE_COORDS[0][1]*COORD_SCALE)}) | "
-              f"COORD_SCALE={COORD_SCALE}")
-        _validate_coord_scale(w_img, h_img)
-
-    # Build a batch of all 16 preprocessed tiles in one pass
-    batch    = []   # will become shape (16, 64, 64, 1)
-    crops    = []   # keep PIL images for optional debug save
-    errored  = {}   # tile_idx -> True for any crop that failed
-
-    for i in range(16):
-        try:
-            tile_pil = _crop_tile(img, i)
-            arr = np.array(tile_pil, dtype=np.float32)   # (64, 64), values 0-255
-            batch.append(arr)
-            crops.append(tile_pil)
-        except Exception as e:
-            print(f"  [OCR] Tile {i} crop error: {e}")
-            batch.append(np.zeros((64, 64), dtype=np.float32))
-            crops.append(None)
-            errored[i] = True
-
-    # Single model.predict() call for all 16 tiles at once
-    batch_arr  = np.stack(batch, axis=0)           # (16, 64, 64)
-    batch_arr  = np.expand_dims(batch_arr, axis=-1) # (16, 64, 64, 1)
-    all_preds  = model.predict(batch_arr, verbose=0) # (16, num_classes)
-
-    letters = []
-    for i in range(16):
-        if i in errored:
-            letters.append("?")
+def load_templates(folder: str = TEMPLATES_DIR) -> None:
+    """Loads your manually named alphabet files from disk into memory."""
+    global _auto_templates
+    os.makedirs(folder, exist_ok=True)
+    loaded = {}
+    for fname in os.listdir(folder):
+        name, ext = os.path.splitext(fname)
+        if ext.lower() not in (".png", ".jpg", ".jpeg") or name.startswith("tile_"):
             continue
+        label = name.upper()
+        path  = os.path.join(folder, fname)
+        img   = Image.open(path).convert("L").resize((SIDE * 3 + 40, SIDE * 3 + 40), Image.LANCZOS)
+        loaded[label.lower()] = np.array(img, dtype=np.float32)
+    _auto_templates = loaded
+    if loaded:
+        print(f"  [OCR] Loaded {len(loaded)} curated templates: {sorted(k.upper() for k in loaded)}")
+    else:
+        print(f"  [WARNING] No letter templates found! Please rename tile_xx.png files to letters (e.g., A.png)")
 
-        confidence = float(np.max(all_preds[i]))
-        class_idx  = int(np.argmax(all_preds[i]))
-        letter     = CLASS_NAMES[class_idx].lower()
 
-        # Low confidence → treat as unreadable rather than a wrong guess
-        if confidence < CONFIDENCE_THRESH:
-            letter = "?"
+def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
+    cx = int(TILE_COORDS[idx][0] * COORD_SCALE)
+    cy = int(TILE_COORDS[idx][1] * COORD_SCALE)
+    h, w = img_grey.shape[:2]
+    x1 = max(0, cx - TILE_CROP_PX)
+    y1 = max(0, cy - TILE_CROP_PX)
+    x2 = min(w, cx + TILE_CROP_PX)
+    y2 = min(h, cy + TILE_CROP_PX)
+    return img_grey[y1:y2, x1:x2]
 
-        letters.append(letter)
 
-        # ── Debug: save the preprocessed 64×64 image the model received ──
-        if DEBUG_OCR and crops[i] is not None:
-            os.makedirs(DEBUG_OCR_DIR, exist_ok=True)
-            fname = f"{DEBUG_OCR_DIR}/tile_{i:02d}_{letter.upper()}_{confidence:.2f}.png"
-            # Save upscaled so it's easy to inspect
-            crops[i].resize((256, 256), Image.NEAREST).save(fname)
+def _template_match(canonical: np.ndarray) -> tuple:
+    """Slides the master templates across a padded tile area to handle shifts."""
+    if not _auto_templates:
+        return "", -1.0
+    
+    # Pad search area by 12px to let templates safely slide if coordinates bounce
+    search_area = cv2.copyMakeBorder(canonical, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255)
+    search_area = search_area.astype(np.float32)
+    
+    best_letter, best_score = "", -1.0
+    for letter, tmpl in _auto_templates.items():
+        if tmpl.shape != canonical.shape:
+            continue
+            
+        res = cv2.matchTemplate(search_area, tmpl, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, _ = cv2.minMaxLoc(res)
+        
+        if max_val > best_score:
+            best_score, best_letter = max_val, letter
+            
+    return best_letter, best_score
 
-    s = "".join(l.upper() for l in letters)
-    print(f"  OCR[CNN]: {s[:4]} {s[4:8]} {s[8:12]} {s[12:]}")
+
+def _read_tile(img_grey: np.ndarray, idx: int) -> str:
+    crop = _crop_tile(img_grey, idx)
+    if crop.size == 0:
+        return "?"
+
+    canonical = _canonical_preprocess(crop)
+    letter, score = _template_match(canonical)
+    
+    if score >= _TMPL_MATCH_THRESHOLD:
+        return letter
+
+    print(f"  [OCR] Unknown character layout at tile {idx:02d} (Best guess: '{letter.upper()}' @ {score:.2f})")
+    return "?"
+
+
+def ocr_board(img: Image.Image) -> list:
+    """Reads all 16 tiles instantly over memory."""
+    img_grey = np.array(img.convert("L"))
+    letters = [_read_tile(img_grey, i) for i in range(16)]
+
+    rows = [" ".join(f"{letters[r*4+c].upper():>2}" for c in range(4)) for r in range(4)]
+    print(f"  OCR[Match]: {rows[0]}")
+    for row in rows[1:]:
+        print(f"              {row}")
     return letters
 
 
 # ─────────────────────────────────────────
-#  DICTIONARY & SOLVER
+#  CALIBRATION
+# ─────────────────────────────────────────
+def calibrate():
+    os.makedirs(TEMPLATES_DIR, exist_ok=True)
+    print("  [calibrate] Connecting to WDA…")
+    get_session()
+    print("  [calibrate] Taking screenshot…")
+    img      = take_screenshot()
+    img_grey = np.array(img.convert("L"))
+    
+    for i in range(16):
+        crop = _crop_tile(img_grey, i)
+        if crop.size == 0:
+            continue
+        canonical = _canonical_preprocess(crop)
+        out_path  = os.path.join(TEMPLATES_DIR, f"tile_{i:02d}.png")
+        cv2.imwrite(out_path, canonical)
+        
+    print(f"\n  Saved 16 processed crops to ./{TEMPLATES_DIR}/")
+    print("  Please map these files to true letters (e.g., rename tile_00.png -> A.png)")
+
+
+# ─────────────────────────────────────────
+#  DICTIONARY
 # ─────────────────────────────────────────
 def load_dictionary(path: str = DICT_PATH):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Dictionary not found: '{path}'")
+
     with open(path, encoding="utf-8", errors="ignore") as fh:
         raw = {line.strip().lower() for line in fh if line.strip()}
+
     words    = {w for w in raw if len(w) >= MIN_WORD_LEN}
     prefixes: set[str] = set()
     for w in words:
@@ -286,6 +221,10 @@ def load_dictionary(path: str = DICT_PATH):
             prefixes.add(w[:i])
     return words, prefixes
 
+
+# ─────────────────────────────────────────
+#  SOLVER & UTILS
+# ─────────────────────────────────────────
 def _build_neighbours():
     nb = {}
     for idx in range(16):
@@ -299,8 +238,10 @@ def _build_neighbours():
 
 NEIGHBOURS = _build_neighbours()
 
+
 def solve_board(letters, words, prefixes):
     found = {}
+
     def dfs(idx, word, path, visited):
         if word not in prefixes:
             return
@@ -319,13 +260,54 @@ def solve_board(letters, words, prefixes):
         if ch and ch != "?":
             dfs(i, ch, [i], {i})
 
-    return found  # caller sorts by tile_score; no need to pre-sort here
+    return dict(sorted(found.items(), key=lambda x: (boggle_score(x[0]), len(x[0])), reverse=True))
 
 
-# ─────────────────────────────────────────
-#  SWIPE
-# ─────────────────────────────────────────
-def swipe_path(indices: list[int]) -> bool:
+_http       = requests.Session()
+_http.headers.update({"Content-Type": "application/json"})
+_session_id = None
+
+
+def _create_session() -> str:
+    r = _http.post(f"{WDA_URL}/session", json={"capabilities": {"alwaysMatch": {}}}, timeout=30)
+    r.raise_for_status()
+    sid = r.json().get("sessionId") or r.json().get("value", {}).get("sessionId")
+    return sid
+
+
+def get_session() -> str:
+    global _session_id
+    if _session_id: return _session_id
+    try:
+        r   = _http.get(f"{WDA_URL}/status", timeout=8)
+        sid = r.json().get("sessionId") or r.json().get("value", {}).get("sessionId")
+        if sid:
+            _session_id = sid
+            return _session_id
+    except Exception: pass
+    _session_id = _create_session()
+    return _session_id
+
+
+def take_screenshot(retries: int = 3) -> Image.Image:
+    global _session_id
+    for attempt in range(retries):
+        try:
+            r = _http.get(f"{WDA_URL}/session/{_session_id}/screenshot", timeout=10)
+            if r.status_code == 404:
+                _session_id = None
+                get_session()
+                continue
+            r.raise_for_status()
+            raw = r.json().get("value", "")
+            if isinstance(raw, dict): raw = raw.get("value", "")
+            return Image.open(BytesIO(base64.b64decode(raw)))
+        except Exception:
+            if attempt < retries - 1: time.sleep(0.2)
+    raise RuntimeError("Screenshot failed.")
+
+
+def swipe_path(indices):
     sid    = get_session()
     sx, sy = TILE_COORDS[indices[0]]
     acts   = [
@@ -335,39 +317,33 @@ def swipe_path(indices: list[int]) -> bool:
     ]
     for idx in indices[1:]:
         tx, ty = TILE_COORDS[idx]
-        acts.append({"type": "pointerMove", "duration": TILE_PAUSE_MS,
-                     "x": int(tx), "y": int(ty)})
-    acts.append({"type": "pause",    "duration": LIFT_DELAY_MS})
+        acts += [{"type": "pointerMove", "duration": TILE_PAUSE_MS, "x": int(tx), "y": int(ty)}]
+    acts.append({"type": "pause", "duration": LIFT_DELAY_MS})
     acts.append({"type": "pointerUp"})
 
-    payload = {"actions": [{"type": "pointer", "id": "finger1",
-                             "parameters": {"pointerType": "touch"}, "actions": acts}]}
+    payload = {"actions": [{"type": "pointer", "id": "finger1", "parameters": {"pointerType": "touch"}, "actions": acts}]}
     try:
-        r = _http.post(f"{WDA_URL}/session/{sid}/actions", json=payload, timeout=20)
+        r = _http.post(f"{WDA_URL}/session/{sid}/actions", json=payload, timeout=5)
         return r.status_code == 200
-    except Exception as e:
-        print(f"    [swipe] exception: {e}")
-        return False
+    except Exception: return False
 
 
-# ─────────────────────────────────────────
-#  MAIN LOOP
-# ─────────────────────────────────────────
+def _tier(w: str) -> int:
+    n = len(w)
+    if n == 7: return 3
+    if n == 6: return 2
+    if n == 5: return 1
+    return 0
+
+
 def run():
+    load_templates()
     words, prefixes = load_dictionary(DICT_PATH)
 
     print("\n" + "=" * 54)
-    print("   Boggle Bot  ⚡  CNN OCR Autonomous Edition")
+    print("   Boggle Bot  ⚡  Template Matching Edition")
     print("=" * 54)
-    print("  ✓  Using 100% accurate perfect_ocr_model.h5 local brain.")
-    print("  ✓  No external APIs. Blazing-fast inference active.")
-    print("Ctrl+C to stop.\n")
-
-    try:
-        get_session()
-    except Exception as e:
-        print(f"  [WDA] Could not connect: {e}")
-        print("  Make sure WebDriverAgent is running on port 8100.\n")
+    get_session()
 
     played:            set[str] = set()
     last_letters:      list     = []
@@ -381,11 +357,8 @@ def run():
 
     def _prefetch_fn(wait: float):
         time.sleep(wait)
-        try:
-            _next_screenshot[0] = take_screenshot()
-        except Exception as e:
-            print(f"  [prefetch] {e}")
-            _next_screenshot[0] = None
+        try: _next_screenshot[0] = take_screenshot()
+        except Exception: _next_screenshot[0] = None
 
     def _start_prefetch(wait: float):
         t = threading.Thread(target=_prefetch_fn, args=(wait,), daemon=True)
@@ -404,92 +377,74 @@ def run():
 
     while True:
         try:
-            # ── OCR ──────────────────────────────────────────────────────────
             img     = _get_img()
             letters = ocr_board(img)
 
-            # Board not visible (between rounds / loading screen)
             if letters.count("?") >= 12:
                 if in_game:
-                    print("\n  ── Board unreadable — round over, waiting... ──")
+                    print("\n  ── Board unreadable — round over... ──")
                     in_game = False
                     played.clear(); last_letters = []; results = {}
                 time.sleep(2.0)
                 continue
 
-            # Idle safety
+            if letters.count("?") > 0:
+                unsettled_start = getattr(run, '_unsettled_since', None)
+                now = time.time()
+                if unsettled_start is None:
+                    run._unsettled_since = now
+                    time.sleep(0.25)
+                    continue
+                elif now - unsettled_start < 3.0:
+                    time.sleep(0.25)
+                    continue
+                else:
+                    run._unsettled_since = None
+                    if in_game:
+                        in_game = False
+                        played.clear(); last_letters = []; results = {}
+                    time.sleep(2.0)
+                    continue
+            run._unsettled_since = None
+
             if in_game and (time.time() - last_swipe_time) > IDLE_TIMEOUT:
-                print("\n  ── Idle timeout — round over, waiting... ──")
                 in_game = False
                 played.clear(); last_letters = []; results = {}
                 time.sleep(3.0)
                 continue
 
-            # Re-solve on genuine board change OR when a swipe just completed.
-            # IMPORTANT: only clear `played` on a real letter change — not after
-            # every swipe — otherwise the bot would endlessly replay the same word.
-            force_resolv      = board_will_change
-            board_changed     = (letters != last_letters)
+            board_changed = (letters != last_letters) or board_will_change
             board_will_change = False
 
-            if board_changed or force_resolv:
-                n_diff = sum(1 for a, b in zip(letters, last_letters) if a != b) if last_letters else 16
-                if last_letters and board_changed:
-                    print(f"  [board] {n_diff}/16 tiles refreshed — new board detected")
-                elif force_resolv and not board_changed:
-                    print(f"  [board] re-solving after swipe (same letters, {len(played)} words already played)")
-
-                if board_changed:
-                    # Genuine new board → reset everything
-                    played.clear()
-                    last_letters = letters[:]
-
+            if board_changed:
+                played.clear()
+                last_letters = letters[:]
                 t0      = time.perf_counter()
                 results = solve_board(letters, words, prefixes)
                 elapsed = time.perf_counter() - t0
                 top     = list(results.items())[:8]
                 top_str = "  ".join(f"{w.upper()}({tile_score(w)}pts)" for w, _ in top)
-                pts     = sum(boggle_score(w) for w in results)
-                print(f"  {len(results)} words  {pts} pts  ({elapsed:.3f}s)")
-                print(f"  Top: {top_str}")
+                print(f"  {len(results)} words solved in ({elapsed:.3f}s) | Top: {top_str}")
                 in_game = True
 
-            # ── Pick best unplayed word ──────────────────────────────────────
-            # Priority tiers: 8+ letter → 7-letter → 6-letter → 5-letter
-            def _tier(w: str) -> int:
-                n = len(w)
-                if n >= 8: return 4   # Boggle max score (11 pts) — never skip these
-                if n == 7: return 3
-                if n == 6: return 2
-                if n == 5: return 1
-                return 0
+            unplayed = [(w, p) for w, p in results.items() if w not in played and MIN_WORD_LEN <= len(w) <= MAX_WORD_LEN]
 
-            candidates = [
-                (w, p) for w, p in results.items()
-                if w not in played and len(w) >= 5   # include all 5+ letter words
-            ]
-
-            remaining = sorted(
-                candidates,
-                key=lambda x: (_tier(x[0]), tile_score(x[0])),
-                reverse=True,
-            )
-
-            if not remaining:
-                print("  No unplayed 5+ letter words on this board — waiting for next...")
+            if not unplayed:
+                print("  No playable words remaining — waiting for board update...")
                 in_game = False
                 time.sleep(2.0)
                 continue
 
-            word, path = remaining[0]
+            unplayed.sort(key=lambda x: (_tier(x[0]), len(x[0])), reverse=True)
+            word, path = unplayed[0]
             played.add(word)
-            score = tile_score(word)
+            score  = tile_score(word)
             print(f"  ▶  {word.upper():<12} +{score}pt  path={path}", end="  ")
             ok = swipe_path(path)
             print("✓" if ok else "✗")
 
             if ok:
-                last_swipe_time   = time.time()
+                last_swipe_time = time.time()
                 board_will_change = True
                 _start_prefetch(BOARD_WAIT_OCR)
 
@@ -502,4 +457,11 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description="Boggle Bot — Template Matching Edition")
+    parser.add_argument("--calibrate", action="store_true", help="Extract templates.")
+    args = parser.parse_args()
+
+    if args.calibrate:
+        calibrate()
+    else:
+        run()
