@@ -40,7 +40,9 @@ BOARD_WAIT_OCR = 0.55
 HOLD_MS        = 50     
 TILE_PAUSE_MS  = 15     
 LIFT_DELAY_MS  = 120    
-IDLE_TIMEOUT   = 4.5    
+IDLE_TIMEOUT   = 4.5   
+
+DEBUG_MODE = False
 
 # ── Word filtering ──
 MIN_WORD_LEN = 5   
@@ -140,9 +142,6 @@ def _preprocess_for_cnn(crops: list) -> np.ndarray:
         batch.append(np.expand_dims(resized, axis=-1))
         
     return np.array(batch, dtype=np.float32)
-# Add this at the top with your configurations
-DEBUG_MODE = False
-
 def ocr_board(img: Image.Image) -> list:
     """Reads all 16 tiles instantly using a single CNN batch prediction."""
     img_grey = np.array(img.convert("L"))
@@ -189,11 +188,276 @@ def ocr_board(img: Image.Image) -> list:
         print(f"              {row}")
         
     return letters
+    """Reads all 16 tiles instantly using a single CNN batch prediction."""
+    img_grey = np.array(img.convert("L"))
+    
+    # Extract 16 square crops
+    raw_crops = [_crop_tile(img_grey, i) for i in range(16)]
+    
+    # Preprocess all 16 at once
+    batch_tensor = _preprocess_for_cnn(raw_crops)
+    
+    # Inference! Pass the batch through the model
+    predictions = ocr_model.predict(batch_tensor, verbose=0)
+    
+    letters = []
+    for pred in predictions:
+        class_idx = np.argmax(pred)
+        confidence = pred[class_idx]
+        
+        if confidence >= CNN_CONFIDENCE_THRESHOLD:
+            letters.append(CLASS_NAMES[class_idx])
+        else:
+            letters.append("?")
 
-# --- UPDATE YOUR MAIN BLOCK ---
+    # Format printout
+    rows = [" ".join(f"{letters[r*4+c].upper():>2}" for c in range(4)) for r in range(4)]
+    print(f"  OCR[CNN]:   {rows[0]}")
+    for row in rows[1:]:
+        print(f"              {row}")
+        
+    return letters
+
+# ─────────────────────────────────────────
+#  DICTIONARY
+# ─────────────────────────────────────────
+def load_dictionary(path: str = DICT_PATH):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Dictionary not found: '{path}'")
+
+    with open(path, encoding="utf-8", errors="ignore") as fh:
+        raw = {line.strip().lower() for line in fh if line.strip()}
+
+    words    = {w for w in raw if len(w) >= MIN_WORD_LEN}
+    prefixes: set[str] = set()
+    for w in words:
+        for i in range(1, len(w) + 1):
+            prefixes.add(w[:i])
+    return words, prefixes
+
+# ─────────────────────────────────────────
+#  SOLVER & UTILS
+# ─────────────────────────────────────────
+def _build_neighbours():
+    nb = {}
+    for idx in range(16):
+        r, c = divmod(idx, 4)
+        nb[idx] = [
+            (r + dr) * 4 + (c + dc)
+            for dr in (-1, 0, 1) for dc in (-1, 0, 1)
+            if (dr or dc) and 0 <= r + dr < 4 and 0 <= c + dc < 4
+        ]
+    return nb
+
+NEIGHBOURS = _build_neighbours()
+
+def solve_board(letters, words, prefixes):
+    found = {}
+
+    def dfs(idx, word, path, visited):
+        if word not in prefixes:
+            return
+        if len(word) >= MIN_WORD_LEN and word in words:
+            if word not in found:
+                found[word] = list(path)
+        for nb in NEIGHBOURS[idx]:
+            if nb not in visited:
+                ch = letters[nb]
+                if ch and ch != "?":
+                    visited.add(nb); path.append(nb)
+                    dfs(nb, word + ch, path, visited)
+                    path.pop(); visited.remove(nb)
+
+    for i, ch in enumerate(letters):
+        if ch and ch != "?":
+            dfs(i, ch, [i], {i})
+
+    return dict(sorted(found.items(), key=lambda x: (boggle_score(x[0]), len(x[0])), reverse=True))
+
+_http       = requests.Session()
+_http.headers.update({"Content-Type": "application/json"})
+_session_id = None
+
+def _create_session() -> str:
+    r = _http.post(f"{WDA_URL}/session", json={"capabilities": {"alwaysMatch": {}}}, timeout=30)
+    r.raise_for_status()
+    sid = r.json().get("sessionId") or r.json().get("value", {}).get("sessionId")
+    return sid
+
+def get_session() -> str:
+    global _session_id
+    if _session_id: return _session_id
+    try:
+        r   = _http.get(f"{WDA_URL}/status", timeout=8)
+        sid = r.json().get("sessionId") or r.json().get("value", {}).get("sessionId")
+        if sid:
+            _session_id = sid
+            return _session_id
+    except Exception: pass
+    _session_id = _create_session()
+    return _session_id
+
+def take_screenshot(retries: int = 3) -> Image.Image:
+    global _session_id
+    for attempt in range(retries):
+        try:
+            r = _http.get(f"{WDA_URL}/session/{_session_id}/screenshot", timeout=10)
+            if r.status_code == 404:
+                _session_id = None
+                get_session()
+                continue
+            r.raise_for_status()
+            raw = r.json().get("value", "")
+            if isinstance(raw, dict): raw = raw.get("value", "")
+            return Image.open(BytesIO(base64.b64decode(raw)))
+        except Exception:
+            if attempt < retries - 1: time.sleep(0.2)
+    raise RuntimeError("Screenshot failed.")
+
+def swipe_path(indices):
+    sid    = get_session()
+    sx, sy = TILE_COORDS[indices[0]]
+    acts   = [
+        {"type": "pointerMove", "duration": 0, "x": int(sx), "y": int(sy)},
+        {"type": "pointerDown"},
+        {"type": "pause",       "duration": HOLD_MS},
+    ]
+    for idx in indices[1:]:
+        tx, ty = TILE_COORDS[idx]
+        acts += [{"type": "pointerMove", "duration": TILE_PAUSE_MS, "x": int(tx), "y": int(ty)}]
+    acts.append({"type": "pause", "duration": LIFT_DELAY_MS})
+    acts.append({"type": "pointerUp"})
+
+    payload = {"actions": [{"type": "pointer", "id": "finger1", "parameters": {"pointerType": "touch"}, "actions": acts}]}
+    try:
+        r = _http.post(f"{WDA_URL}/session/{sid}/actions", json=payload, timeout=5)
+        return r.status_code == 200
+    except Exception: return False
+
+def _tier(w: str) -> int:
+    n = len(w)
+    if n == 7: return 3
+    if n == 6: return 2
+    if n == 5: return 1
+    return 0
+
 def run():
-    # ... (Keep your existing dictionary loading and while loop logic exactly the same) ...
-    pass # (Don't copy this pass, keep your run loop)
+    words, prefixes = load_dictionary(DICT_PATH)
+
+    print("\n" + "=" * 54)
+    print("   Boggle Bot  ⚡  CNN Vision Edition")
+    print("=" * 54)
+    get_session()
+
+    played:            set[str] = set()
+    last_letters:      list     = []
+    results:           dict     = {}
+    last_swipe_time             = time.time()
+    in_game                     = False
+    board_will_change: bool     = False
+
+    _next_screenshot: list = [None]
+    _prefetch_thread: list = [None]
+
+    def _prefetch_fn(wait: float):
+        time.sleep(wait)
+        try: _next_screenshot[0] = take_screenshot()
+        except Exception: _next_screenshot[0] = None
+
+    def _start_prefetch(wait: float):
+        t = threading.Thread(target=_prefetch_fn, args=(wait,), daemon=True)
+        t.start()
+        _prefetch_thread[0] = t
+
+    def _get_img() -> Image.Image:
+        if _prefetch_thread[0] is not None:
+            _prefetch_thread[0].join(timeout=2.0)
+            _prefetch_thread[0] = None
+        if _next_screenshot[0] is not None:
+            img = _next_screenshot[0]
+            _next_screenshot[0] = None
+            return img
+        return take_screenshot()
+
+    while True:
+        try:
+            img     = _get_img()
+            letters = ocr_board(img)
+
+            if letters.count("?") >= 12:
+                if in_game:
+                    print("\n  ── Board unreadable — round over... ──")
+                    in_game = False
+                    played.clear(); last_letters = []; results = {}
+                time.sleep(2.0)
+                continue
+
+            if letters.count("?") > 0:
+                unsettled_start = getattr(run, '_unsettled_since', None)
+                now = time.time()
+                if unsettled_start is None:
+                    run._unsettled_since = now
+                    time.sleep(0.25)
+                    continue
+                elif now - unsettled_start < 3.0:
+                    time.sleep(0.25)
+                    continue
+                else:
+                    run._unsettled_since = None
+                    if in_game:
+                        in_game = False
+                        played.clear(); last_letters = []; results = {}
+                    time.sleep(2.0)
+                    continue
+            run._unsettled_since = None
+
+            if in_game and (time.time() - last_swipe_time) > IDLE_TIMEOUT:
+                in_game = False
+                played.clear(); last_letters = []; results = {}
+                time.sleep(3.0)
+                continue
+
+            board_changed = (letters != last_letters) or board_will_change
+            board_will_change = False
+
+            if board_changed:
+                played.clear()
+                last_letters = letters[:]
+                t0      = time.perf_counter()
+                results = solve_board(letters, words, prefixes)
+                elapsed = time.perf_counter() - t0
+                top     = list(results.items())[:8]
+                top_str = "  ".join(f"{w.upper()}({tile_score(w)}pts)" for w, _ in top)
+                print(f"  {len(results)} words solved in ({elapsed:.3f}s) | Top: {top_str}")
+                in_game = True
+
+            unplayed = [(w, p) for w, p in results.items() if w not in played and MIN_WORD_LEN <= len(w) <= MAX_WORD_LEN]
+
+            if not unplayed:
+                print("  No playable words remaining — waiting for board update...")
+                in_game = False
+                time.sleep(2.0)
+                continue
+
+            unplayed.sort(key=lambda x: (_tier(x[0]), len(x[0])), reverse=True)
+            word, path = unplayed[0]
+            played.add(word)
+            score  = tile_score(word)
+            print(f"  ▶  {word.upper():<12} +{score}pt  path={path}", end="  ")
+            ok = swipe_path(path)
+            print("✓" if ok else "✗")
+
+            if ok:
+                last_swipe_time = time.time()
+                board_will_change = True
+                _start_prefetch(BOARD_WAIT_OCR)
+
+        except KeyboardInterrupt:
+            print("\nBot stopped.")
+            break
+        except Exception as e:
+            print(f"  Error: {e}")
+            time.sleep(2)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Boggle Bot — CNN Vision Edition")
@@ -203,4 +467,7 @@ if __name__ == "__main__":
     if args.debug:
         DEBUG_MODE = True
         
+    run()
+    parser = argparse.ArgumentParser(description="Boggle Bot — CNN Vision Edition")
+    args = parser.parse_args()
     run()
