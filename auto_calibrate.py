@@ -1,10 +1,10 @@
 """
-click_calibrate.py — A simple tool to calculate your perfect grid coordinates.
+click_calibrate.py — A simple tool to calculate your perfect grid coordinates using matplotlib.
 """
 
-import tkinter as tk
-from PIL import Image, ImageTk
 import os
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
 
 # ── Configuration ──────────────────────────────────────────
 IMG_PATH = "debug_tiles/00_full_screenshot.png"
@@ -15,48 +15,28 @@ if not os.path.exists(IMG_PATH):
     print("Run debug_ocr.py first so it saves a screenshot!")
     exit()
 
-clicks = []
-
-def on_click(event):
-    clicks.append((event.x, event.y))
-    if len(clicks) == 1:
-        print(f"✓ Top-Left clicked. Now click the BOTTOM-RIGHT tile center.")
-    elif len(clicks) == 2:
-        root.destroy()
-
-# ── GUI Setup ──────────────────────────────────────────────
-root = tk.Tk()
-root.title("Click TOP-LEFT tile center, then BOTTOM-RIGHT tile center")
-
-# Load and scale image so it fits on laptop screens
-img = Image.open(IMG_PATH)
-w, h = img.size
-scale = 800 / h if h > 800 else 1.0
-
-if scale < 1.0:
-    img_resized = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-else:
-    img_resized = img
-    scale = 1.0
-
-tk_img = ImageTk.PhotoImage(img_resized)
-canvas = tk.Canvas(root, width=tk_img.width(), height=tk_img.height(), cursor="crosshair")
-canvas.pack()
-canvas.create_image(0, 0, anchor=tk.NW, image=tk_img)
-canvas.bind("<Button-1>", on_click)
-
-print("Opening window... (check behind your other windows if you don't see it)")
+print("Opening window... (Check behind your terminal if it doesn't pop to the front)")
 print("1️⃣  Click the exact dead-center of the TOP-LEFT tile.")
 print("2️⃣  Click the exact dead-center of the BOTTOM-RIGHT tile.")
-root.mainloop()
+
+# Load the image
+img = mpimg.imread(IMG_PATH)
+
+# Set up the plot
+fig, ax = plt.subplots(figsize=(6, 10))
+ax.imshow(img)
+ax.set_title("1. Click TOP-LEFT tile center\n2. Click BOTTOM-RIGHT tile center\n(Window will close automatically)", fontsize=10)
+ax.axis("off") # Hide the axis numbers
+plt.tight_layout()
+
+# ginput(2) waits for exactly 2 mouse clicks, timeout=0 means it waits forever
+clicks = plt.ginput(2, timeout=0)
+plt.close()
 
 # ── Math & Output ──────────────────────────────────────────
 if len(clicks) == 2:
-    # Convert scaled clicks back to absolute physical pixels
-    tl_x = clicks[0][0] / scale
-    tl_y = clicks[0][1] / scale
-    br_x = clicks[1][0] / scale
-    br_y = clicks[1][1] / scale
+    tl_x, tl_y = clicks[0]
+    br_x, br_y = clicks[1]
     
     # Calculate spacing (3 gaps between 4 tiles)
     step_x = (br_x - tl_x) / 3
@@ -83,4 +63,4 @@ if len(clicks) == 2:
     print("}")
     print("\n" + "═"*60)
 else:
-    print("Calibration cancelled or closed early.")
+    print("❌ Calibration cancelled. You didn't click twice.")
