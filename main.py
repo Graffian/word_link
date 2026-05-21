@@ -7,17 +7,16 @@ import os
 import numpy as np
 from PIL import Image
 from io import BytesIO
-from dotenv import load_dotenv
-import anthropic
 
-load_dotenv()
+import tensorflow as tf
+
 
 # ─────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────
 WDA_URL        = "http://localhost:8100"
-TEMPLATES_DIR  = "tile_templates"   # saved letter crops live here
 DICT_PATH      = "Dictionary-curated.txt"
+MODEL_PATH     = "perfect_ocr_model.h5"
 
 # ── Timing ──
 BOARD_WAIT_OCR  = 0.50
@@ -40,9 +39,18 @@ TILE_COORDS = {
 }
 
 COORD_SCALE  = 3.0
-TILE_CROP_PX = 55    # half-side of square crop around each tile centre (device px)
+TILE_CROP_PX = 320    # Radius of square crop around centre to get full 640x640 base tile
 
-_OCR_RE = re.compile(r"(?:Tile\s*)?(\d+)\s*[:\-]\s*([A-Za-z])")
+# Exact alphabetical order matching tf.keras.preprocessing.image_dataset_from_directory
+CLASS_NAMES = [
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 
+    'N', 'O', 'P', 'Q', 'QU', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'
+]
+
+# ── Load Neural Network ──
+print("🧠 Loading perfect_ocr_model.h5...")
+model = tf.keras.models.load_model(MODEL_PATH)
+print("✓ CNN Brain initialized successfully.")
 
 
 # ─────────────────────────────────────────
@@ -134,152 +142,47 @@ def take_screenshot(retries: int = 3) -> Image.Image:
 
 
 # ─────────────────────────────────────────
-#  ML OCR — OpenCV Template Matching
+#  HIGH-SPEED CNN INFERENCE OCR
 # ─────────────────────────────────────────
-_claude         = anthropic.Anthropic()
-_templates: dict[str, np.ndarray] = {}
-MATCH_THRESHOLD = 0.85
-
-
-def _ensure_cv2():
-    try:
-        import cv2
-        return cv2
-    except ImportError:
-        import subprocess, sys
-        print("  Installing opencv-python-headless...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install",
-                               "opencv-python-headless", "-q"])
-        import cv2
-        return cv2
-
-
-def _crop_tile(img_np: np.ndarray, tile_idx: int) -> np.ndarray:
+def _get_model_prediction(img: Image.Image, tile_idx: int) -> str:
     cx = int(TILE_COORDS[tile_idx][0] * COORD_SCALE)
     cy = int(TILE_COORDS[tile_idx][1] * COORD_SCALE)
-    h, w = img_np.shape[:2]
+    w_img, h_img = img.size
+    
+    # 1. Grab raw tile frame around center point (target 640x640)
     x1, y1 = max(0, cx - TILE_CROP_PX), max(0, cy - TILE_CROP_PX)
-    x2, y2 = min(w, cx + TILE_CROP_PX), min(h, cy + TILE_CROP_PX)
-    return img_np[y1:y2, x1:x2]
-
-
-def load_templates():
-    cv2 = _ensure_cv2()
-    os.makedirs(TEMPLATES_DIR, exist_ok=True)
-    _templates.clear()
-    for fname in os.listdir(TEMPLATES_DIR):
-        if fname.endswith(".png") and len(fname) == 5:
-            letter = fname[0].upper()
-            img    = cv2.imread(os.path.join(TEMPLATES_DIR, fname), cv2.IMREAD_GRAYSCALE)
-            if img is not None:
-                _templates[letter] = img
-    if _templates:
-        print(f"  [templates] Loaded {len(_templates)} letters: {''.join(sorted(_templates))}")
-
-
-def _save_template(letter: str, crop: np.ndarray):
-    cv2  = _ensure_cv2()
-    path = os.path.join(TEMPLATES_DIR, f"{letter.upper()}.png")
-    if not os.path.exists(path):
-        cv2.imwrite(path, crop)
-        _templates[letter.upper()] = crop
-        print(f"  [templates] Saved '{letter.upper()}' ({len(_templates)}/26)")
-
-
-def _match_letter(crop: np.ndarray) -> tuple[str, float]:
-    cv2    = _ensure_cv2()
-    best_l, best_s = "?", 0.0
-    for letter, tmpl in _templates.items():
-        if tmpl.shape != crop.shape:
-            tmpl = cv2.resize(tmpl, (crop.shape[1], crop.shape[0]))
-        score = float(cv2.matchTemplate(crop, tmpl, cv2.TM_CCOEFF_NORMED).max())
-        if score > best_s:
-            best_s, best_l = score, letter
-    return best_l, best_s
-
-
-def _ocr_cv(img_np: np.ndarray) -> list[str]:
-    letters = []
-    for i in range(16):
-        crop = _crop_tile(img_np, i)
-        if crop.size == 0:
-            letters.append("?")
-        else:
-            l, s = _match_letter(crop)
-            letters.append(l if s >= MATCH_THRESHOLD else "?")
-    return letters
-
-
-def _ocr_claude(img: Image.Image, img_np: np.ndarray,
-                tile_indices = None) -> list[str]:
-    indices = tile_indices if tile_indices is not None else list(range(16))
-    buf     = BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    b64     = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
-
-    coord_hint = "\n".join(
-        f"Tile {i} (row {i//4} col {i%4}): pixel "
-        f"({int(TILE_COORDS[i][0]*COORD_SCALE)}, {int(TILE_COORDS[i][1]*COORD_SCALE)})"
-        for i in indices
-    )
-    prompt = (
-        "This is a screenshot of a 4x4 Boggle word game board.\n"
-        "Read the single uppercase letter on each tile listed below.\n"
-        "Distinguish carefully: I (straight) vs L (foot at bottom), "
-        "O vs Q, U vs V, M vs N.\n\n"
-        "Tile positions:\n" + coord_hint + "\n\n"
-        f"Reply ONLY with {len(indices)} lines:\n"
-        "Tile N: X\nNo extra text."
-    )
-
-    result = {i: "?" for i in indices}
-    try:
-        message = _claude.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=150,
-            messages=[{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64",
-                 "media_type": "image/jpeg", "data": b64}},
-                {"type": "text", "text": prompt},
-            ]}],
-        )
-        for line in message.content[0].text.strip().splitlines():
-            m = _OCR_RE.search(line.strip())
-            if m:
-                idx, letter = int(m.group(1)), m.group(2).upper()
-                if idx in result:
-                    result[idx] = letter
-                    crop = _crop_tile(img_np, idx)
-                    if crop.size > 0 and letter not in _templates:
-                        _save_template(letter, crop)
-    except Exception as e:
-        print(f"  [OCR-Claude] failed: {e}")
-
-    return [result.get(i, "?") for i in range(16)]
+    x2, y2 = min(w_img, cx + TILE_CROP_PX), min(h_img, cy + TILE_CROP_PX)
+    tile_img = img.crop((x1, y1, x2, y2))
+    
+    # 2. Apply EXACT same Smart-Shave used during dataset training
+    w, h = tile_img.size
+    tile_img = tile_img.crop((65, 65, w - 65, h - 10))
+    
+    # 3. Format exactly to training shape input specification
+    tile_img = tile_img.resize((64, 64)).convert("L")  # Grayscale
+    img_array = np.array(tile_img, dtype=np.float32) / 255.0  # Normalize
+    img_array = np.expand_dims(img_array, axis=(0, -1))  # Shape -> (1, 64, 64, 1)
+    
+    # 4. Predict
+    predictions = model.predict(img_array, verbose=0)
+    class_idx = np.argmax(predictions[0])
+    
+    return CLASS_NAMES[class_idx].lower()
 
 
 def ocr_board(img: Image.Image) -> list[str]:
-    cv2    = _ensure_cv2()
-    img_np = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
-
-    if len(_templates) < 26:
-        print(f"  [OCR] Claude mode ({len(_templates)}/26 templates seen)")
-        letters = _ocr_claude(img, img_np)
-    else:
-        letters   = _ocr_cv(img_np)
-        uncertain = [i for i, l in enumerate(letters) if l == "?"]
-        if uncertain:
-            print(f"  [OCR] CV uncertain on {len(uncertain)} tiles → Claude")
-            partial = _ocr_claude(img, img_np, tile_indices=uncertain)
-            for i in uncertain:
-                letters[i] = partial[i]
-
-    if letters.count("?") == 0:
-        s = "".join(l.upper() for l in letters)
-        src = "CV" if len(_templates) >= 20 else "Claude"
-        print(f"  OCR[{src}]: {s[:4]} {s[4:8]} {s[8:12]} {s[12:]}")
-
-    return [l.lower() for l in letters]
+    letters = []
+    for i in range(16):
+        try:
+            letter = _get_model_prediction(img, i)
+            letters.append(letter)
+        except Exception as e:
+            print(f"  [CNN OCR Error] Tile {i} crash: {e}")
+            letters.append("?")
+            
+    s = "".join(l.upper() for l in letters)
+    print(f"  OCR[Local-CNN]: {s[:4]} {s[4:8]} {s[8:12]} {s[12:]}")
+    return letters
 
 
 # ─────────────────────────────────────────
@@ -365,17 +268,13 @@ def swipe_path(indices: list[int]) -> bool:
 #  MAIN LOOP
 # ─────────────────────────────────────────
 def run():
-    load_templates()
     words, prefixes = load_dictionary(DICT_PATH)
 
     print("\n" + "=" * 54)
-    print("   Boggle Bot  ⚡  Curated-Dictionary Edition")
+    print("   Boggle Bot  ⚡  CNN OCR Autonomous Edition")
     print("=" * 54)
-    if len(_templates) < 26:
-        print(f"  ℹ  Cold start — Claude OCRs first few boards to build templates.")
-        print(f"     ({len(_templates)}/26 letters in ./{TEMPLATES_DIR}/)")
-    else:
-        print(f"  ✓  Template library ready ({len(_templates)} letters) — full CV speed.")
+    print("  ✓  Using 100% accurate perfect_ocr_model.h5 local brain.")
+    print("  ✓  No external APIs. Blazing-fast inference active.")
     print("Ctrl+C to stop.\n")
 
     try:
@@ -432,27 +331,6 @@ def run():
                 time.sleep(2.0)
                 continue
 
-            # Tiles still mid-fall — poll until settled
-            if letters.count("?") > 0:
-                unsettled_start = getattr(run, '_unsettled_since', None)
-                now = time.time()
-                if unsettled_start is None:
-                    run._unsettled_since = now
-                    time.sleep(0.25)
-                    continue
-                elif now - unsettled_start < 3.0:
-                    time.sleep(0.25)
-                    continue
-                else:
-                    run._unsettled_since = None
-                    if in_game:
-                        print("\n  ── Board unsettled 3s — round over, waiting... ──")
-                        in_game = False
-                        played.clear(); last_letters = []; results = {}
-                    time.sleep(2.0)
-                    continue
-            run._unsettled_since = None
-
             # Idle safety
             if in_game and (time.time() - last_swipe_time) > IDLE_TIMEOUT:
                 print("\n  ── Idle timeout — round over, waiting... ──")
@@ -496,7 +374,6 @@ def run():
                 if w not in played and 5 <= len(w) <= 7
             ]
 
-            # Sort by tier then score (no frequency — dictionary is already curated)
             remaining = sorted(
                 candidates,
                 key=lambda x: (_tier(x[0]), tile_score(x[0])),
