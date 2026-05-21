@@ -98,6 +98,12 @@ def tile_score(word: str) -> int:
 print("  [Init] Booting TensorFlow Vision Engine...")
 try:
     ocr_model = tf.keras.models.load_model(MODEL_PATH)
+    print("Model classes (indices):", CLASS_NAMES)
+    print("--- MODEL MAPPING CONFIRMATION ---")
+# If you used image_dataset_from_directory, the labels are derived from folder names
+# We just need to ensure the order is correct. 
+# Run this once and check your terminal:
+    print(f"Index Mapping: {os.listdir('dataset')}")
 except Exception as e:
     print(f"  [Error] Failed to load {MODEL_PATH}. Did you run train_model.py?")
     exit(1)
