@@ -1,18 +1,3 @@
-"""
-Boggle Bot — Deep Learning CNN Edition
-──────────────────────────────────────────────────────────────────────────
-Pipeline:
-  1. Screenshot via WebDriverAgent
-  2. Crop 16 tiles -> Apply exact dataset "Shave" -> Batch to Tensor
-  3. CNN Inference (predicts all 16 letters instantly)
-  4. DFS solver over the curated dictionary
-  5. Swipe the best word's tile path on the board
-  6. Repeat on new board
-
-Requirements:
-  pip install pillow numpy requests opencv-python tensorflow
-"""
-
 import argparse
 import requests
 import time
@@ -20,7 +5,6 @@ import base64
 import os
 import threading
 import numpy as np
-import cv2
 from PIL import Image
 from io import BytesIO
 
@@ -50,10 +34,10 @@ MAX_WORD_LEN = 7
 
 # ── Crop & Shave (CNN Params) ──
 COORD_SCALE  = 3.0    
-TILE_CROP_PX = 100    # 320 radius = 640x640 total square (Matches your dataset bases!)
+TILE_CROP_PX = 100    # 100 radius = 200x200 physical screen tile
 SHAVE_PIXELS = 65     
 CNN_TARGET_SIZE = (64, 64)
-CNN_CONFIDENCE_THRESHOLD = 0.60
+CNN_CONFIDENCE_THRESHOLD = 0.40
 
 # Keras image_dataset_from_directory sorts classes alphanumerically
 CLASS_NAMES = [
@@ -98,55 +82,10 @@ def tile_score(word: str) -> int:
 print("  [Init] Booting TensorFlow Vision Engine...")
 try:
     ocr_model = tf.keras.models.load_model(MODEL_PATH)
-    print("Model classes (indices):", CLASS_NAMES)
-    print("--- MODEL MAPPING CONFIRMATION ---")
-# If you used image_dataset_from_directory, the labels are derived from folder names
-# We just need to ensure the order is correct. 
-# Run this once and check your terminal:
 except Exception as e:
     print(f"  [Error] Failed to load {MODEL_PATH}. Did you run train_model.py?")
     exit(1)
 
-def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
-    cx = int(TILE_COORDS[idx][0] * COORD_SCALE)
-    cy = int(TILE_COORDS[idx][1] * COORD_SCALE)
-    h, w = img_grey.shape[:2]
-    x1 = max(0, cx - TILE_CROP_PX)
-    y1 = max(0, cy - TILE_CROP_PX)
-    x2 = min(w, cx + TILE_CROP_PX)
-    y2 = min(h, cy + TILE_CROP_PX)
-    return img_grey[y1:y2, x1:x2]
-
-def _canonical_preprocess(crop: np.ndarray) -> np.ndarray:
-    """Restored from your original script to match dataset generation!"""
-    # 1. Scale 200x200 up to 600x600
-    large = cv2.resize(crop, (TILE_CROP_PX * 6, TILE_CROP_PX * 6), interpolation=cv2.INTER_CUBIC)
-    
-    # 2. Threshold to pure "crazy clear" Black & White
-    _, bw = cv2.threshold(large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if np.mean(bw) < 127:
-        bw = cv2.bitwise_not(bw)
-        
-    # 3. Pad to 640x640
-    return cv2.copyMakeBorder(bw, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
-
-def _preprocess_for_cnn(crops: list) -> np.ndarray:
-    """Processes live game tiles identically to generate_dataset.py"""
-    batch = []
-    for crop in crops:
-        # First, turn the raw crop into the 640x640 B&W canvas your model trained on
-        canonical = _canonical_preprocess(crop)
-        
-        # NOW apply the exact 65px shave to the 640x640 image
-        h, w = canonical.shape
-        shaved = canonical[SHAVE_PIXELS : h - 10, SHAVE_PIXELS : w - SHAVE_PIXELS]
-        
-        # Finally, squish to 64x64 for the CNN brain
-        resized = cv2.resize(shaved, CNN_TARGET_SIZE, interpolation=cv2.INTER_AREA)
-        
-        batch.append(np.expand_dims(resized, axis=-1))
-        
-    return np.array(batch, dtype=np.float32)
 def ocr_board(img: Image.Image) -> list:
     """Reads all 16 tiles instantly using a single CNN batch prediction."""
     batch = []
@@ -202,66 +141,6 @@ def ocr_board(img: Image.Image) -> list:
             for idx in top_3_idx:
                 print(f"          {CLASS_NAMES[idx].upper():>2} : {pred[idx]*100:>5.1f}%")
         
-        # We can drop the confidence threshold slightly since your model is so accurate
-        if confidence >= 0.40:
-            letters.append(CLASS_NAMES[class_idx])
-        else:
-            letters.append("?")
-
-    # Format printout
-    rows = [" ".join(f"{letters[r*4+c].upper():>2}" for c in range(4)) for r in range(4)]
-    print(f"\n  OCR[CNN]:   {rows[0]}")
-    for row in rows[1:]:
-        print(f"              {row}")
-        
-    return [l.lower() for l in letters]
-    """Reads all 16 tiles instantly using a single CNN batch prediction."""
-    batch = []
-    w_img, h_img = img.size
-    
-    for i in range(16):
-        # 1. Map to exact center coordinates
-        cx = int(TILE_COORDS[i][0] * COORD_SCALE)
-        cy = int(TILE_COORDS[i][1] * COORD_SCALE)
-        
-        # 2. Grab the 640x640 raw crop
-        x1, y1 = max(0, cx - TILE_CROP_PX), max(0, cy - TILE_CROP_PX)
-        x2, y2 = min(w_img, cx + TILE_CROP_PX), min(h_img, cy + TILE_CROP_PX)
-        tile_img = img.crop((x1, y1, x2, y2))
-        
-        # 3. Apply EXACT Smart-Shave (65 sides/top, 10 bottom)
-        w, h = tile_img.size
-        tile_img = tile_img.crop((SHAVE_PIXELS, SHAVE_PIXELS, w - SHAVE_PIXELS, h - 10))
-        
-        # 4. Resize and grayscale exactly like the dataset
-        tile_img = tile_img.resize(CNN_TARGET_SIZE).convert("L")
-        
-        # --- DEBUG VISION DUMP ---
-        if DEBUG_MODE:
-            os.makedirs("debug_vision", exist_ok=True)
-            tile_img.save(f"debug_vision/tile_{i:02d}.png")
-            
-        # 5. Format to Tensor
-        img_array = np.array(tile_img, dtype=np.float32)
-        batch.append(np.expand_dims(img_array, axis=-1))
-
-    # Batch shape becomes (16, 64, 64, 1)
-    batch_tensor = np.array(batch)
-    
-    # 6. Inference!
-    predictions = ocr_model.predict(batch_tensor, verbose=0)
-    
-    letters = []
-    for i, pred in enumerate(predictions):
-        class_idx = np.argmax(pred)
-        confidence = pred[class_idx]
-        
-        if DEBUG_MODE:
-            print(f"  [Debug] Tile {i:02d} Top 3:")
-            top_3_idx = np.argsort(pred)[-3:][::-1]
-            for idx in top_3_idx:
-                print(f"          {CLASS_NAMES[idx].upper():>2} : {pred[idx]*100:>5.1f}%")
-        
         if confidence >= CNN_CONFIDENCE_THRESHOLD:
             letters.append(CLASS_NAMES[class_idx])
         else:
@@ -274,80 +153,6 @@ def ocr_board(img: Image.Image) -> list:
         print(f"              {row}")
         
     return [l.lower() for l in letters]
-    """Reads all 16 tiles instantly using a single CNN batch prediction."""
-    img_grey = np.array(img.convert("L"))
-    
-    # Extract 16 square crops
-    raw_crops = [_crop_tile(img_grey, i) for i in range(16)]
-    
-    # Preprocess all 16 at once
-    batch_tensor = _preprocess_for_cnn(raw_crops)
-    
-    # --- DEBUG VISION DUMP ---
-    if DEBUG_MODE:
-        os.makedirs("debug_vision", exist_ok=True)
-        print("\n  [Debug] Dumping CNN inputs to ./debug_vision/")
-        for i, tensor in enumerate(batch_tensor):
-            # Tensor is shape (64, 64, 1), we need to squeeze it to (64, 64) to save as PNG
-            debug_img = tensor.astype(np.uint8).squeeze()
-            cv2.imwrite(f"debug_vision/tile_{i:02d}.png", debug_img)
-    
-    # Inference! Pass the batch through the model
-    predictions = ocr_model.predict(batch_tensor, verbose=0)
-    
-    letters = []
-    for i, pred in enumerate(predictions):
-        class_idx = np.argmax(pred)
-        confidence = pred[class_idx]
-        
-        # --- DEBUG LOGGING ---
-        if DEBUG_MODE:
-            print(f"  [Debug] Tile {i:02d} Top 3:")
-            top_3_idx = np.argsort(pred)[-3:][::-1]
-            for idx in top_3_idx:
-                print(f"          {CLASS_NAMES[idx].upper():>2} : {pred[idx]*100:>5.1f}%")
-        
-        if confidence >= CNN_CONFIDENCE_THRESHOLD:
-            letters.append(CLASS_NAMES[class_idx])
-        else:
-            letters.append("?")
-
-    # Format printout
-    rows = [" ".join(f"{letters[r*4+c].upper():>2}" for c in range(4)) for r in range(4)]
-    print(f"\n  OCR[CNN]:   {rows[0]}")
-    for row in rows[1:]:
-        print(f"              {row}")
-        
-    return letters
-    """Reads all 16 tiles instantly using a single CNN batch prediction."""
-    img_grey = np.array(img.convert("L"))
-    
-    # Extract 16 square crops
-    raw_crops = [_crop_tile(img_grey, i) for i in range(16)]
-    
-    # Preprocess all 16 at once
-    batch_tensor = _preprocess_for_cnn(raw_crops)
-    
-    # Inference! Pass the batch through the model
-    predictions = ocr_model.predict(batch_tensor, verbose=0)
-    
-    letters = []
-    for pred in predictions:
-        class_idx = np.argmax(pred)
-        confidence = pred[class_idx]
-        
-        if confidence >= CNN_CONFIDENCE_THRESHOLD:
-            letters.append(CLASS_NAMES[class_idx])
-        else:
-            letters.append("?")
-
-    # Format printout
-    rows = [" ".join(f"{letters[r*4+c].upper():>2}" for c in range(4)) for r in range(4)]
-    print(f"  OCR[CNN]:   {rows[0]}")
-    for row in rows[1:]:
-        print(f"              {row}")
-        
-    return letters
 
 # ─────────────────────────────────────────
 #  DICTIONARY
@@ -598,7 +403,4 @@ if __name__ == "__main__":
     if args.debug:
         DEBUG_MODE = True
         
-    run()
-    parser = argparse.ArgumentParser(description="Boggle Bot — CNN Vision Edition")
-    args = parser.parse_args()
     run()
