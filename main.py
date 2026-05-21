@@ -164,7 +164,7 @@ def _get_model_prediction(img: Image.Image, tile_idx: int) -> str:
     
     # 3. Format exactly to training shape input specification
     tile_img = tile_img.resize((64, 64)).convert("L")  # Grayscale
-    img_array = np.array(tile_img, dtype=np.float32) / 255.0  # Normalize
+    img_array = np.array(tile_img, dtype=np.float32)  # No manual normalize — Rescaling(1./255) layer handles it
     img_array = np.expand_dims(img_array, axis=(0, -1))  # Shape -> (1, 64, 64, 1)
     
     # 4. Predict
