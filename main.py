@@ -110,24 +110,36 @@ def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
     y2 = min(h, cy + TILE_CROP_PX)
     return img_grey[y1:y2, x1:x2]
 
+def _canonical_preprocess(crop: np.ndarray) -> np.ndarray:
+    """Restored from your original script to match dataset generation!"""
+    # 1. Scale 200x200 up to 600x600
+    large = cv2.resize(crop, (TILE_CROP_PX * 6, TILE_CROP_PX * 6), interpolation=cv2.INTER_CUBIC)
+    
+    # 2. Threshold to pure "crazy clear" Black & White
+    _, bw = cv2.threshold(large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(bw) < 127:
+        bw = cv2.bitwise_not(bw)
+        
+    # 3. Pad to 640x640
+    return cv2.copyMakeBorder(bw, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+
 def _preprocess_for_cnn(crops: list) -> np.ndarray:
-    """Takes 16 raw crops, shaves them matching the dataset, and batches them."""
+    """Processes live game tiles identically to generate_dataset.py"""
     batch = []
     for crop in crops:
-        h, w = crop.shape
+        # First, turn the raw crop into the 640x640 B&W canvas your model trained on
+        canonical = _canonical_preprocess(crop)
         
-        # Exact shave logic from generate_dataset.py
-        # Numpy slicing is [Y, X] -> [top:bottom, left:right]
-        shaved = crop[SHAVE_PIXELS : h - 10, SHAVE_PIXELS : w - SHAVE_PIXELS]
+        # NOW apply the exact 65px shave to the 640x640 image
+        h, w = canonical.shape
+        shaved = canonical[SHAVE_PIXELS : h - 10, SHAVE_PIXELS : w - SHAVE_PIXELS]
         
-        # Resize to 64x64 for the CNN
+        # Finally, squish to 64x64 for the CNN brain
         resized = cv2.resize(shaved, CNN_TARGET_SIZE, interpolation=cv2.INTER_AREA)
         
-        # Add the channel dimension so shape is (64, 64, 1)
         batch.append(np.expand_dims(resized, axis=-1))
         
     return np.array(batch, dtype=np.float32)
-
 def ocr_board(img: Image.Image) -> list:
     """Reads all 16 tiles instantly using a single CNN batch prediction."""
     img_grey = np.array(img.convert("L"))
