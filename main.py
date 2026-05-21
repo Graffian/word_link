@@ -152,33 +152,34 @@ def _get_model_prediction(img: Image.Image, tile_idx: int) -> str:
     cx = int(TILE_COORDS[tile_idx][0] * COORD_SCALE)
     cy = int(TILE_COORDS[tile_idx][1] * COORD_SCALE)
     w_img, h_img = img.size
-    
-    # 1. Grab raw tile frame around center point (target 640x640)
-    x1, y1 = max(0, cx - TILE_CROP_PX), max(0, cy - TILE_CROP_PX)
-    x2, y2 = min(w_img, cx + TILE_CROP_PX), min(h_img, cy + TILE_CROP_PX)
-    tile_img = img.crop((x1, y1, x2, y2))
-    
+
+    if tile_idx == 0:
+        print(f"  [DEBUG] Screenshot: {w_img}x{h_img} | tile_0 center: ({cx},{cy}) | crop radius: {TILE_CROP_PX}")
+
+    # 1. Pad-crop: always produce exactly TILE_CROP_PX*2 square regardless of edge proximity
+    full = Image.new("RGB", (TILE_CROP_PX * 2, TILE_CROP_PX * 2), (0, 0, 0))
+    src_x1 = max(0, cx - TILE_CROP_PX)
+    src_y1 = max(0, cy - TILE_CROP_PX)
+    src_x2 = min(w_img, cx + TILE_CROP_PX)
+    src_y2 = min(h_img, cy + TILE_CROP_PX)
+    paste_x = src_x1 - (cx - TILE_CROP_PX)
+    paste_y = src_y1 - (cy - TILE_CROP_PX)
+    full.paste(img.crop((src_x1, src_y1, src_x2, src_y2)), (paste_x, paste_y))
+    tile_img = full
+
     # 2. Apply EXACT same Smart-Shave used during dataset training
     w, h = tile_img.size
     tile_img = tile_img.crop((65, 65, w - 65, h - 10))
     
     # 3. Format exactly to training shape input specification
     tile_img = tile_img.convert("RGB").resize((64, 64)).convert("L")  # RGB first (matches training), then Grayscale
-
-    # ── DEBUG ──
-    os.makedirs("debug_tiles", exist_ok=True)
-    tile_img.save(f"debug_tiles/tile_{tile_idx}.png")
-    # ───────────
-
     img_array = np.array(tile_img, dtype=np.float32)  # No manual normalize — Rescaling(1./255) layer handles it
     img_array = np.expand_dims(img_array, axis=(0, -1))  # Shape -> (1, 64, 64, 1)
     
     # 4. Predict
     predictions = model.predict(img_array, verbose=0)
     class_idx = np.argmax(predictions[0])
-    confidence = predictions[0][class_idx]
-    print(f"  [DEBUG] tile_{tile_idx}: {CLASS_NAMES[class_idx]} ({confidence*100:.1f}%)")
-
+    
     return CLASS_NAMES[class_idx].lower()
 
 
