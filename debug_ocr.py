@@ -7,29 +7,30 @@ Usage:
 It takes ONE screenshot via WDA, runs every tile through the same
 preprocessing pipeline as main.py, saves 16 images to debug_tiles/,
 and prints a confidence table so you can see exactly what the model sees.
-
-You do NOT need to edit main.py or set any flags.
 """
 
 import os
 import base64
 import requests
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 from io import BytesIO
 import tensorflow as tf
 
-# ── Copy these values from your main.py ──────────────────────────────────────
+# ── Configuration ────────────────────────────────────────────────────────────
 WDA_URL      = "http://localhost:8100"
 MODEL_PATH   = "perfect_ocr_model.h5"
 COORD_SCALE  = 3.0
 
+# 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 👇 
+# PASTE YOUR CALIBRATED DICTIONARY HERE
 TILE_COORDS = {
      0: (  86,  391),  1: ( 174,  391),  2: ( 263,  391),  3: ( 352,  391),
      4: (  86,  480),  5: ( 174,  480),  6: ( 263,  480),  7: ( 352,  480),
      8: (  86,  569),  9: ( 174,  569), 10: ( 263,  569), 11: ( 352,  569),
     12: (  86,  658), 13: ( 174,  658), 14: ( 263,  658), 15: ( 352,  658),
 }
+# 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆 👆
 
 CLASS_NAMES = [
     'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
@@ -45,7 +46,6 @@ print("Taking screenshot via WDA...")
 http = requests.Session()
 http.headers.update({"Content-Type": "application/json"})
 
-# Try to find or create a session
 sid = None
 try:
     status = http.get(f"{WDA_URL}/status", timeout=8).json()
@@ -71,7 +71,7 @@ print(f"  Screenshot size: {w_img}×{h_img}")
 screenshot.save(f"{OUT_DIR}/00_full_screenshot.png")
 print(f"  Saved: {OUT_DIR}/00_full_screenshot.png")
 
-# ── 2. Draw tile crop boxes on the screenshot so you can see where we're looking ──
+# ── 2. Draw tile crop boxes on the screenshot ─────────────────────────────────
 annotated = screenshot.copy().convert("RGB")
 draw = ImageDraw.Draw(annotated)
 
@@ -83,25 +83,21 @@ for idx, (lx, ly) in TILE_COORDS.items():
     cx = int(lx * COORD_SCALE)
     cy = int(ly * COORD_SCALE)
     
-    # Draw the tight crop boundary
     draw.rectangle(
         [cx - phys_radius, cy - phys_radius,
          cx + phys_radius, cy + phys_radius],
         outline=(255, 0, 0), width=4
     )
-    # Draw the tile centre crosshair
     r = 12
     draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(0, 255, 0), width=4)
     draw.text((cx - 10, cy - phys_radius + 5), str(idx), fill=(255, 255, 0))
 
-# Scale down for easy viewing
 scale_factor = min(1.0, 1200 / max(w_img, h_img))
 preview_w = int(w_img * scale_factor)
 preview_h = int(h_img * scale_factor)
 annotated_small = annotated.resize((preview_w, preview_h), Image.LANCZOS)
 annotated_small.save(f"{OUT_DIR}/01_tile_positions.png")
 print(f"  Saved: {OUT_DIR}/01_tile_positions.png")
-print(f"  ↳  Open this to verify the red boxes fit neatly inside the flat white area of each tile.")
 
 # ── 3. Load model ─────────────────────────────────────────────────────────────
 print(f"\nLoading model: {MODEL_PATH}")
@@ -129,15 +125,16 @@ for i in range(16):
     )
     
     full = screenshot.crop(box)
-    
-    # Keep it natural grayscale to match P.png
     full = full.resize((64, 64)).convert("L")
+
+    # The high threshold to preserve anti-aliased loops (like in P, B, R)
+    full = full.point(lambda p: 255 if p > 220 else 0)
 
     tiles_pil.append(full)
     batch.append(np.array(full, dtype=np.float32))
 
-batch_arr = np.stack(batch, axis=0)[:, :, :, np.newaxis]  # (16, 64, 64, 1)
-preds     = model.predict(batch_arr, verbose=0)            # (16, num_classes)
+batch_arr = np.stack(batch, axis=0)[:, :, :, np.newaxis]
+preds     = model.predict(batch_arr, verbose=0)
 
 for i in range(16):
     p         = preds[i]
@@ -150,7 +147,6 @@ for i in range(16):
 
     print(f"  {i:>4}  {pred:>4}  {conf:>5.1%}  {second:>4}  {conf2:>6.1%}  {status}")
 
-    # Save the 64×64 stark black-and-white tile scaled up 4× for easy inspection
     fname = f"{OUT_DIR}/tile_{i:02d}_{pred}_{conf:.2f}.png"
     tiles_pil[i].resize((256, 256), Image.NEAREST).save(fname)
 
