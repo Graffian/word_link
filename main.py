@@ -207,7 +207,7 @@ def load_dictionary(path: str = DICT_PATH):
         raise FileNotFoundError(f"Dictionary not found: '{path}'")
 
     with open(path, encoding="utf-8", errors="ignore") as fh:
-        raw = {line.strip().lower() for line in fh if line.strip()}
+        raw = {line.strip().upper() for line in fh if line.strip()}
 
     words    = {w for w in raw if len(w) >= MIN_WORD_LEN}
     prefixes: set[str] = set()
