@@ -209,11 +209,50 @@ def load_dictionary(path: str = DICT_PATH):
     with open(path, encoding="utf-8", errors="ignore") as fh:
         raw = {line.strip().upper() for line in fh if line.strip()}
 
-    words    = {w for w in raw if len(w) >= MIN_WORD_LEN}
+    words: set[str] = {w for w in raw if len(w) >= MIN_WORD_LEN}
     prefixes: set[str] = set()
     for w in words:
         for i in range(1, len(w) + 1):
             prefixes.add(w[:i])
+    return words, prefixes
+
+def load_fallback_dictionary(path: str = "words.txt"):
+    """Fallback: ENABLE word list filtered by real-world frequency via wordfreq."""
+    import subprocess, sys
+    ENABLE_URL = "https://raw.githubusercontent.com/dolph/dictionary/master/enable1.txt"
+
+    try:
+        from wordfreq import word_frequency
+    except ImportError:
+        print("  [Fallback Dict] Installing wordfreq...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "wordfreq", "-q"])
+        from wordfreq import word_frequency
+
+    if not os.path.exists(path):
+        print("  [Fallback Dict] Downloading ENABLE word list...")
+        r = subprocess.run(["curl", "-s", "-o", path, ENABLE_URL], capture_output=True)
+        if r.returncode != 0:
+            print(f"  [Fallback Dict] Download failed — no fallback available.")
+            return set(), set()
+        print(f"  [Fallback Dict] Downloaded → {path}")
+
+    print("  [Fallback Dict] Filtering by word frequency...")
+    with open(path, encoding="utf-8", errors="ignore") as f:
+        raw = {w.strip().upper() for w in f if MIN_WORD_LEN <= len(w.strip()) <= 16}
+
+    def _keep(w):
+        freq = word_frequency(w.lower(), "en")
+        n = len(w)
+        if n <= 4: return freq >= 3e-5
+        if n <= 6: return freq >= 8e-6
+        return freq >= 1e-6
+
+    words: set[str] = {w for w in raw if _keep(w)}
+    prefixes: set[str] = set()
+    for w in words:
+        for i in range(1, len(w) + 1):
+            prefixes.add(w[:i])
+    print(f"  [Fallback Dict] {len(words):,} words ready.")
     return words, prefixes
 
 # ─────────────────────────────────────────
@@ -324,6 +363,7 @@ def _tier(w: str) -> int:
 
 def run():
     words, prefixes = load_dictionary(DICT_PATH)
+    fb_words, fb_prefixes = load_fallback_dictionary()
 
     print("\n" + "=" * 54)
     print("   Boggle Bot  ⚡  CNN Vision Edition")
@@ -407,6 +447,10 @@ def run():
                 t0      = time.perf_counter()
                 results = solve_board(letters, words, prefixes)
                 elapsed = time.perf_counter() - t0
+                # Fallback to ENABLE frequency dict if curated finds nothing
+                if not results and fb_words:
+                    print(f"  [Fallback] Curated dict found 0 words — trying ENABLE fallback...")
+                    results = solve_board(letters, fb_words, fb_prefixes)
                 top     = list(results.items())[:8]
                 top_str = "  ".join(f"{w.upper()}({tile_score(w)}pts)" for w, _ in top)
                 print(f"  {len(results)} words solved in ({elapsed:.3f}s) | Top: {top_str}")
