@@ -492,7 +492,8 @@ def run():
                 print(f"  {len(results)} words solved in ({elapsed:.3f}s){src} | Top: {top_str}")
                 in_game = True
 
-            unplayed = [(w, p) for w, p in results.items() if w not in played and MIN_WORD_LEN <= len(w) <= MAX_WORD_LEN]
+            # All found words, shortest allowed is MIN_WORD_LEN (3)
+            unplayed = [(w, p) for w, p in results.items() if w not in played and len(w) >= MIN_WORD_LEN]
 
             if not unplayed:
                 print("  No playable words remaining — waiting for board update...")
@@ -500,7 +501,11 @@ def run():
                 time.sleep(2.0)
                 continue
 
-            unplayed.sort(key=lambda x: (_tier(x[0]), len(x[0])), reverse=True)
+            # Sort longest first — play 7s, then 6s, then 5s, then 4s, then 3s
+            unplayed.sort(key=lambda x: len(x[0]), reverse=True)
+            best_len = len(unplayed[0][0])
+            # Only play words at the current best length this iteration
+            unplayed = [(w, p) for w, p in unplayed if len(w) == best_len]
             word, path = unplayed[0]
             played.add(word)
             score  = tile_score(word)
