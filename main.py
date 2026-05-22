@@ -8,6 +8,9 @@ Pipeline:
   4. DFS solver over the curated dictionary
   5. Swipe the best word's tile path on the board
   6. Repeat on new board
+
+Requirements:
+  pip install pillow numpy requests opencv-python tensorflow
 """
 
 import argparse
@@ -96,6 +99,11 @@ print("  [Init] Booting TensorFlow Vision Engine...")
 try:
     ocr_model = tf.keras.models.load_model(MODEL_PATH)
     print("Model classes (indices):", CLASS_NAMES)
+    print("--- MODEL MAPPING CONFIRMATION ---")
+# If you used image_dataset_from_directory, the labels are derived from folder names
+# We just need to ensure the order is correct. 
+# Run this once and check your terminal:
+
 except Exception as e:
     print(f"  [Error] Failed to load {MODEL_PATH}. Did you run train_model.py?")
     exit(1)
@@ -110,22 +118,36 @@ def _crop_tile(img_grey: np.ndarray, idx: int) -> np.ndarray:
     y2 = min(h, cy + TILE_CROP_PX)
     return img_grey[y1:y2, x1:x2]
 
+def _canonical_preprocess(crop: np.ndarray) -> np.ndarray:
+    """Restored from your original script to match dataset generation!"""
+    # 1. Scale 200x200 up to 600x600
+    large = cv2.resize(crop, (TILE_CROP_PX * 6, TILE_CROP_PX * 6), interpolation=cv2.INTER_CUBIC)
+    
+    # 2. Threshold to pure "crazy clear" Black & White
+    _, bw = cv2.threshold(large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(bw) < 127:
+        bw = cv2.bitwise_not(bw)
+        
+    # 3. Pad to 640x640
+    return cv2.copyMakeBorder(bw, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+
 def _preprocess_for_cnn(crops: list) -> np.ndarray:
-    """Processes live game tiles identically to generate_dataset.py. No canonical scaling!"""
+    """Processes live game tiles identically to generate_dataset.py"""
     batch = []
     for crop in crops:
-        h, w = crop.shape
+        # First, turn the raw crop into the 640x640 B&W canvas your model trained on
+        canonical = _canonical_preprocess(crop)
         
-        # Apply the exact Cookie Cutter shave used in dataset generation
-        shaved = crop[SHAVE_PIXELS : h - 10, SHAVE_PIXELS : w - SHAVE_PIXELS]
+        # NOW apply the exact 65px shave to the 640x640 image
+        h, w = canonical.shape
+        shaved = canonical[SHAVE_PIXELS : h - 10, SHAVE_PIXELS : w - SHAVE_PIXELS]
         
-        # Resize to CNN target (64x64)
+        # Finally, squish to 64x64 for the CNN brain
         resized = cv2.resize(shaved, CNN_TARGET_SIZE, interpolation=cv2.INTER_AREA)
         
         batch.append(np.expand_dims(resized, axis=-1))
         
     return np.array(batch, dtype=np.float32)
-
 def ocr_board(img: Image.Image) -> list:
     """Reads all 16 tiles instantly using a single CNN batch prediction."""
     img_grey = np.array(img.convert("L"))
@@ -133,7 +155,7 @@ def ocr_board(img: Image.Image) -> list:
     # Extract 16 square crops
     raw_crops = [_crop_tile(img_grey, i) for i in range(16)]
     
-    # Preprocess all 16 at once using the corrected pipeline
+    # Preprocess all 16 at once
     batch_tensor = _preprocess_for_cnn(raw_crops)
     
     # --- DEBUG VISION DUMP ---
@@ -141,6 +163,7 @@ def ocr_board(img: Image.Image) -> list:
         os.makedirs("debug_vision", exist_ok=True)
         print("\n  [Debug] Dumping CNN inputs to ./debug_vision/")
         for i, tensor in enumerate(batch_tensor):
+            # Tensor is shape (64, 64, 1), we need to squeeze it to (64, 64) to save as PNG
             debug_img = tensor.astype(np.uint8).squeeze()
             cv2.imwrite(f"debug_vision/tile_{i:02d}.png", debug_img)
     
@@ -160,7 +183,11 @@ def ocr_board(img: Image.Image) -> list:
                 print(f"          {CLASS_NAMES[idx].upper():>2} : {pred[idx]*100:>5.1f}%")
         
         if confidence >= CNN_CONFIDENCE_THRESHOLD:
-            letters.append(CLASS_NAMES[class_idx])
+            predicted = CLASS_NAMES[class_idx]
+            # Q alone doesn't exist in Boggle — always treat it as QU
+            if predicted == 'Q':
+                predicted = 'QU'
+            letters.append(predicted)
         else:
             letters.append("?")
 
@@ -416,9 +443,21 @@ def run():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Boggle Bot — CNN Vision Edition")
     parser.add_argument("--debug", action="store_true", help="Dump CNN inputs and confidence scores.")
+    parser.add_argument("--test", metavar="IMAGE", help="Run OCR on a local screenshot instead of connecting to device.")
     args = parser.parse_args()
-    
+
     if args.debug:
         DEBUG_MODE = True
-        
-    run()
+
+    if args.test:
+        print(f"\n  [Test Mode] Loading screenshot: {args.test}")
+        if not os.path.exists(args.test):
+            print(f"  [ERROR] File not found: {args.test}")
+            exit(1)
+        img = Image.open(args.test)
+        print(f"  [Test Mode] Image size: {img.size}")
+        letters = ocr_board(img)
+        print("\n  [Test Mode] Raw letters list:")
+        print(f"  {letters}")
+    else:
+        run()
