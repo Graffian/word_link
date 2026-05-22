@@ -37,9 +37,9 @@ MODEL_PATH = "perfect_ocr_model.h5"
 
 # ── Timing ──
 BOARD_WAIT_OCR = 0.55   
-HOLD_MS        = 50     
-TILE_PAUSE_MS  = 15     
-LIFT_DELAY_MS  = 120    
+HOLD_MS        = 20     
+TILE_PAUSE_MS  = 8     
+LIFT_DELAY_MS  = 60    
 IDLE_TIMEOUT   = 4.5   
 
 DEBUG_MODE = False
