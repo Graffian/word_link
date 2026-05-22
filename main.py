@@ -45,7 +45,7 @@ IDLE_TIMEOUT   = 4.5
 DEBUG_MODE = False
 
 # ── Word filtering ──
-MIN_WORD_LEN = 5   
+MIN_WORD_LEN = 3   
 MAX_WORD_LEN = 16  # no cap — board can have 8+ letter words
 
 # ── Crop & Shave (CNN Params) ──
