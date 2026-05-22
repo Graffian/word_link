@@ -46,7 +46,7 @@ DEBUG_MODE = False
 
 # ── Word filtering ──
 MIN_WORD_LEN = 5   
-MAX_WORD_LEN = 7
+MAX_WORD_LEN = 16  # no cap — board can have 8+ letter words
 
 # ── Crop & Shave (CNN Params) ──
 COORD_SCALE  = 3.0    
@@ -216,8 +216,23 @@ def load_dictionary(path: str = DICT_PATH):
             prefixes.add(w[:i])
     return words, prefixes
 
+def _build_prefix_set(words: set) -> set:
+    prefixes: set[str] = set()
+    for w in words:
+        for i in range(1, len(w) + 1):
+            prefixes.add(w[:i])
+    return prefixes
+
 def load_fallback_dictionary(path: str = "words.txt"):
-    """Fallback: ENABLE word list filtered by real-world frequency via wordfreq."""
+    """
+    Loads the ENABLE word list and builds three tiers by frequency:
+      tier_strict  — common words only (game will almost always accept)
+      tier_loose   — broader set (rare but valid words)
+      tier_full    — everything in ENABLE >= MIN_WORD_LEN (nuclear option)
+    Returns (tier_strict_words, tier_strict_prefixes,
+             tier_loose_words,  tier_loose_prefixes,
+             tier_full_words,   tier_full_prefixes)
+    """
     import subprocess, sys
     ENABLE_URL = "https://raw.githubusercontent.com/dolph/dictionary/master/enable1.txt"
 
@@ -233,27 +248,33 @@ def load_fallback_dictionary(path: str = "words.txt"):
         r = subprocess.run(["curl", "-s", "-o", path, ENABLE_URL], capture_output=True)
         if r.returncode != 0:
             print(f"  [Fallback Dict] Download failed — no fallback available.")
-            return set(), set()
+            empty = set()
+            return empty, empty, empty, empty, empty, empty
         print(f"  [Fallback Dict] Downloaded → {path}")
 
-    print("  [Fallback Dict] Filtering by word frequency...")
     with open(path, encoding="utf-8", errors="ignore") as f:
         raw = {w.strip().upper() for w in f if MIN_WORD_LEN <= len(w.strip()) <= 16}
 
-    def _keep(w):
-        freq = word_frequency(w.lower(), "en")
-        n = len(w)
-        if n <= 4: return freq >= 3e-5
-        if n <= 6: return freq >= 8e-6
-        return freq >= 1e-6
+    tier_strict: set[str] = set()
+    tier_loose:  set[str] = set()
 
-    words: set[str] = {w for w in raw if _keep(w)}
-    prefixes: set[str] = set()
-    for w in words:
-        for i in range(1, len(w) + 1):
-            prefixes.add(w[:i])
-    print(f"  [Fallback Dict] {len(words):,} words ready.")
-    return words, prefixes
+    for w in raw:
+        freq = word_frequency(w.lower(), "en")
+        n    = len(w)
+        # Strict: words the game will almost certainly accept
+        if n <= 6:
+            if freq >= 5e-6: tier_strict.add(w)
+            if freq >= 1e-6: tier_loose.add(w)
+        else:
+            if freq >= 5e-7: tier_strict.add(w)
+            if freq >= 1e-7: tier_loose.add(w)
+
+    print(f"  [Fallback Dict] strict={len(tier_strict):,}  loose={len(tier_loose):,}  full={len(raw):,}")
+    return (
+        tier_strict, _build_prefix_set(tier_strict),
+        tier_loose,  _build_prefix_set(tier_loose),
+        raw,         _build_prefix_set(raw),
+    )
 
 # ─────────────────────────────────────────
 #  SOLVER & UTILS
@@ -355,15 +376,14 @@ def swipe_path(indices):
     except Exception: return False
 
 def _tier(w: str) -> int:
-    n = len(w)
-    if n == 7: return 3
-    if n == 6: return 2
-    if n == 5: return 1
-    return 0
+    """Score by length — longer is always better."""
+    return len(w)
 
 def run():
     words, prefixes = load_dictionary(DICT_PATH)
-    fb_words, fb_prefixes = load_fallback_dictionary()
+    (fb_strict, fb_strict_pre,
+     fb_loose,  fb_loose_pre,
+     fb_full,   fb_full_pre)  = load_fallback_dictionary()
 
     print("\n" + "=" * 54)
     print("   Boggle Bot  ⚡  CNN Vision Edition")
@@ -445,15 +465,31 @@ def run():
                 played.clear()
                 last_letters = letters[:]
                 t0      = time.perf_counter()
+
+                # ── Cascading dictionary: curated → strict → loose → full ──
                 results = solve_board(letters, words, prefixes)
+                fallback_used = None
+
+                if not results and fb_strict:
+                    print("  [Dict] Curated empty — trying fallback strict...")
+                    results = solve_board(letters, fb_strict, fb_strict_pre)
+                    fallback_used = "strict"
+
+                if not results and fb_loose:
+                    print("  [Dict] Strict empty — trying fallback loose...")
+                    results = solve_board(letters, fb_loose, fb_loose_pre)
+                    fallback_used = "loose"
+
+                if not results and fb_full:
+                    print("  [Dict] Loose empty — trying full ENABLE list...")
+                    results = solve_board(letters, fb_full, fb_full_pre)
+                    fallback_used = "full"
+
                 elapsed = time.perf_counter() - t0
-                # Fallback to ENABLE frequency dict if curated finds nothing
-                if not results and fb_words:
-                    print(f"  [Fallback] Curated dict found 0 words — trying ENABLE fallback...")
-                    results = solve_board(letters, fb_words, fb_prefixes)
                 top     = list(results.items())[:8]
                 top_str = "  ".join(f"{w.upper()}({tile_score(w)}pts)" for w, _ in top)
-                print(f"  {len(results)} words solved in ({elapsed:.3f}s) | Top: {top_str}")
+                src     = f" [{fallback_used}]" if fallback_used else ""
+                print(f"  {len(results)} words solved in ({elapsed:.3f}s){src} | Top: {top_str}")
                 in_game = True
 
             unplayed = [(w, p) for w, p in results.items() if w not in played and MIN_WORD_LEN <= len(w) <= MAX_WORD_LEN]
