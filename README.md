@@ -39,6 +39,10 @@ Optional: `--debug` dumps the preprocessed tiles + confidence scores so you can 
 - `Dictionary-curated.txt` — curated word list
 - `perfect_ocr_model.h5` — the trained CNN model
 
+## Model training
+
+See [`cnn_model.md`](cnn_model.md) or the [standalone training repo](https://github.com/Graffian/word_link_cnn) for how the CNN was trained (dataset generation, architecture, training process, inference) and how to retrain it. Feedback, suggestions, and improvements are always welcome — open an issue or a PR!
+
 ---
 
 
